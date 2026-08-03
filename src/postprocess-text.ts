@@ -53,12 +53,6 @@ export interface FormatContentChunksOptions {
    * section; trailing headings that restate the next section are dropped.
    */
   nextSectionLabel?: string
-
-  /**
-   * Markdown blocks to emit before a page's first chunk (illustrations).
-   * Text is never joined across these.
-   */
-  getPageBlocks?: (page: number) => string[]
 }
 
 export function normalizeLabel(label: string): string {
@@ -144,8 +138,7 @@ export function formatContentChunks(
     detectHeadings = true,
     headingLevel = 3,
     sectionLabel,
-    nextSectionLabel,
-    getPageBlocks
+    nextSectionLabel
   }: FormatContentChunksOptions = {}
 ): string {
   const sectionLabelKey = sectionLabel
@@ -154,7 +147,6 @@ export function formatContentChunks(
   const nextSectionLabelKey = nextSectionLabel
     ? normalizeLabel(nextSectionLabel)
     : undefined
-  const seenPages = new Set<number>()
   const blocks: Block[] = []
 
   // The trailing paragraph of the previous chunk, held back so the next chunk
@@ -171,17 +163,6 @@ export function formatContentChunks(
   }
 
   for (const chunk of chunks) {
-    if (!seenPages.has(chunk.page)) {
-      seenPages.add(chunk.page)
-
-      const pageBlocks = getPageBlocks?.(chunk.page) ?? []
-      if (pageBlocks.length) {
-        // An illustration interrupts the text, so never join across it.
-        flush()
-        blocks.push(...pageBlocks.map((markdown) => ({ markdown })))
-      }
-    }
-
     const paragraphs = splitParagraphs(chunk.text)
 
     for (const [i, paragraph] of paragraphs.entries()) {

@@ -34,27 +34,6 @@ export interface ContentChunk {
   screenshot: string
 }
 
-export interface IllustrationChunk {
-  index: number
-  page: number
-  illustrationIndex: number
-  description: string
-  reason: string
-  kind: string
-  candidateIndex: number
-  keepScore: number
-  confidence: number
-  bbox: {
-    topPercent: number
-    leftPercent: number
-    widthPercent: number
-    heightPercent: number
-  }
-  screenshot: string
-  illustration: string
-  retries?: number
-}
-
 export interface PageNav {
   page?: number
   location?: number

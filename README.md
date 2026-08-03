@@ -26,9 +26,15 @@ read. The pipeline is three stages, and each one resumes:
 Re-running skips any stage whose output already exists, so an interrupted book
 picks up where it left off. Use `--force-ocr` (or `--force`) to redo a stage.
 
+Transcription resumes at page granularity: if some pages fail, re-running
+retries only those, rather than paying to read the whole book again. Pages that
+could never be read are listed explicitly and the command exits non-zero — an
+export with holes in it isn't success, even though a file was written.
+
 ## Install
 
-Requires Node 20+, Google Chrome, and an OpenAI API key.
+Requires Node 20+ and an OpenAI API key. Uses Google Chrome if installed,
+otherwise Playwright's bundled Chromium.
 
 ```bash
 git clone https://github.com/sjoblom/kindle-export
@@ -72,8 +78,12 @@ configurable.
 
 ### Platform support
 
-Developed and tested on **macOS only**. It should work anywhere Node and Chrome
-do, but Linux and Windows are genuinely untested — reports welcome.
+Developed and tested on **macOS**. It uses Google Chrome when installed and
+falls back to Playwright's bundled Chromium otherwise, which should cover Linux
+and containers — but that fallback path is **untested**, so treat Linux and
+Windows as unverified rather than supported. Set `BROWSER_CHANNEL` to pick a
+specific channel (`chrome`, `msedge`, …) or leave it unset for the default.
+Reports welcome.
 
 ## Usage
 

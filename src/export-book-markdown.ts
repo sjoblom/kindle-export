@@ -3,19 +3,12 @@ import 'dotenv/config'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
-import type { BookMetadata, ContentChunk, IllustrationChunk } from './types'
+import type { BookMetadata, ContentChunk } from './types'
 import { formatContentChunks } from './postprocess-text'
 import { resolveBookSections } from './toc-sections'
-import { assert, readJsonFile, tryReadJsonFile } from './utils'
+import { assert, readJsonFile } from './utils'
 
 const MAX_MARKDOWN_FILENAME_STEM_LENGTH = 80
-
-function formatIllustration(illustration: IllustrationChunk): string {
-  const alt = illustration.description?.trim() || 'Illustration'
-  const filename = path.basename(illustration.illustration)
-  const relativeImagePath = path.posix.join('illustrations', filename)
-  return `![${alt}](${relativeImagePath})`
-}
 
 function truncateFilenameStem(stem: string): string {
   if (stem.length <= MAX_MARKDOWN_FILENAME_STEM_LENGTH) return stem
@@ -44,17 +37,12 @@ function filenameFromTitle(title: string): string {
 
 function formatChunks(
   chunks: ContentChunk[],
-  illustrationsByPage: Record<number, IllustrationChunk[]>,
   { headingLevel, sectionLabel, nextSectionLabel }: FormatChunksOptions = {}
 ): string {
   return formatContentChunks(chunks, {
     headingLevel,
     sectionLabel,
-    nextSectionLabel,
-    getPageBlocks: (page) =>
-      (illustrationsByPage[page] ?? []).map((illustration) =>
-        formatIllustration(illustration)
-      )
+    nextSectionLabel
   })
 }
 
@@ -84,10 +72,6 @@ export async function exportBookMarkdown({
   const content = await readJsonFile<ContentChunk[]>(
     path.join(outDir, 'content.json')
   )
-  const illustrations =
-    (await tryReadJsonFile<IllustrationChunk[]>(
-      path.join(outDir, 'illustrations.json')
-    )) ?? []
   const metadata = await readJsonFile<BookMetadata>(
     path.join(outDir, 'metadata.json')
   )
@@ -100,18 +84,6 @@ export async function exportBookMarkdown({
   const publisher = metadata.meta.publisher
   const totalPages = metadata.nav.totalNumContentPages
   const bookAsin = metadata.meta.asin
-  const illustrationsByPage = illustrations.reduce(
-    (acc, illustration) => {
-      const list = (acc[illustration.page] ??= [])
-      list.push(illustration)
-      return acc
-    },
-    {} as Record<number, IllustrationChunk[]>
-  )
-  for (const items of Object.values(illustrationsByPage)) {
-    items.sort((a, b) => a.illustrationIndex - b.illustrationIndex)
-  }
-
   // Format release date from DD/MM/YYYY to a human-friendly format
   const formattedDate = (() => {
     const raw = metadata.meta.releaseDate
@@ -191,7 +163,7 @@ ${sections
 ---`
 
   for (const { tocItem, chunks, nextLabel } of sections) {
-    const text = formatChunks(chunks, illustrationsByPage, {
+    const text = formatChunks(chunks, {
       // Section headings found in the body nest under the TOC heading below.
       headingLevel: tocItem.depth + 3,
       sectionLabel: tocItem.label,

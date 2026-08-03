@@ -162,28 +162,6 @@ describe('formatContentChunks', () => {
     expect(out).toBe('FAILING THE MOM TEST\n\nBody.')
   })
 
-  it('never joins across an inserted page block', () => {
-    const out = formatContentChunks(
-      chunks([1, 'the sentence continues'], [2, 'onto the next page']),
-      { getPageBlocks: (page) => (page === 2 ? ['![Figure](a.png)'] : []) }
-    )
-
-    expect(out).toBe(
-      'the sentence continues\n\n![Figure](a.png)\n\nonto the next page'
-    )
-  })
-
-  it('emits page blocks once per page, not once per chunk', () => {
-    const out = formatContentChunks(
-      chunks([1, 'One.'], [1, 'Two.'], [2, 'Three.']),
-      { getPageBlocks: (page) => [`![p${page}](p${page}.png)`] }
-    )
-
-    expect(out).toBe(
-      ['![p1](p1.png)', 'One.', 'Two.', '![p2](p2.png)', 'Three.'].join('\n\n')
-    )
-  })
-
   it('joins without a space after a dash', () => {
     const out = formatContentChunks(
       chunks([1, 'he said—'], [2, 'well, maybe.'])

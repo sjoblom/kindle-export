@@ -79,7 +79,17 @@ export type Page = Awaited<ReturnType<BrowserContext['newPage']>>
 
 export interface LaunchBrowserOptions {
   profileDir?: string
+  /**
+   * Chrome release channel. Defaults to installed Google Chrome, falling back
+   * to Playwright's bundled Chromium when Chrome isn't present — which is the
+   * common case on Linux and in containers.
+   */
+  channel?: string
 }
+
+/** Playwright's message when the requested channel isn't installed. */
+const MISSING_CHANNEL_REGEX =
+  /channel .*(not (installed|found))|Executable doesn't exist|Chromium distribution/i
 
 async function cleanupStaleSingletonLocks(profileDir: string) {
   for (const filename of [
@@ -157,13 +167,15 @@ export async function launchBrowserContext(
   await fs.mkdir(profileDir, { recursive: true })
 
   let context: BrowserContext | undefined
+  let channel: string | undefined =
+    opts?.channel?.trim() || getEnv('BROWSER_CHANNEL')?.trim() || 'chrome'
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       await ensureBrowserProfileAvailable(profileDir)
       context = await chromium.launchPersistentContext(profileDir, {
         headless: false,
-        channel: 'chrome',
+        ...(channel ? { channel } : {}),
         args: [
           // hide chrome's crash restore popup
           '--hide-crash-restore-bubble',
@@ -227,6 +239,19 @@ export async function launchBrowserContext(
       return context
     } catch (err) {
       await context?.close().catch(() => {})
+
+      // Google Chrome isn't installed (usual on Linux and in containers), so
+      // fall back to the Chromium that ships with Playwright.
+      if (
+        channel &&
+        MISSING_CHANNEL_REGEX.test((err as Error)?.message ?? '')
+      ) {
+        console.warn(
+          `Google Chrome not found; falling back to bundled Chromium. Set BROWSER_CHANNEL to override.`
+        )
+        channel = undefined
+        continue
+      }
 
       if (attempt >= 3) {
         throw err

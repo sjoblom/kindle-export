@@ -7,11 +7,12 @@ import { OpenAIClient } from 'openai-fetch'
 import pMap from 'p-map'
 
 import type { BookMetadata, ContentChunk, TocItem } from './types'
-import { assert, getEnv, readJsonFile } from './utils'
+import { assert, getEnv, readJsonFile, tryReadJsonFile } from './utils'
 
 const DEFAULT_OCR_MODEL = 'gpt-4.1-mini'
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
 const DEFAULT_CONCURRENCY = 16
+const DEFAULT_MAX_RETRIES = 20
 const REFUSAL_REGEX =
   /\b(i('| a)?m sorry|can't help|cannot help|cannot comply|unable to|policy)\b/i
 const VERBOSE_LOGGING = getEnv('KINDLE_EXPORT_VERBOSE') === '1'
@@ -47,6 +48,30 @@ function getTemperature(model: string, retries: number): number | undefined {
   return retries < 2 ? 0 : 0.5
 }
 
+/** The subset of the OpenAI client this module uses, so tests can fake it. */
+export interface ChatCompletionClient {
+  createChatCompletion(
+    params: any,
+    opts?: { signal?: AbortSignal }
+  ): Promise<{ choices: Array<{ message: { content?: string | null } }> }>
+}
+
+export interface FailedPage {
+  index: number
+  page: number
+  screenshot: string
+  error: string
+}
+
+export interface TranscribeBookResult {
+  content: ContentChunk[]
+  /**
+   * Pages that could not be read. Their text is simply absent from `content`,
+   * so callers must surface this rather than treating the result as complete.
+   */
+  failedPages: FailedPage[]
+}
+
 export interface TranscribeBookOptions {
   asin: string
   /** Root directory holding one folder per ASIN. Defaults to `out`. */
@@ -57,14 +82,22 @@ export interface TranscribeBookOptions {
   requestTimeoutMs?: number
   /** Page images read in parallel. */
   concurrency?: number
+  /** Attempts per page before giving up on it. */
+  maxRetries?: number
+  /** Re-read every page, discarding text transcribed on a previous run. */
+  force?: boolean
   /** Called as each page completes, for progress reporting. */
   onProgress?: (done: number, total: number) => void
+  /** Injectable for tests; defaults to a real OpenAI client. */
+  client?: ChatCompletionClient
 }
 
 /**
  * Transcribe a book's captured page images to text.
  *
- * Returns the chunks written to `content.json`, one per page image.
+ * Pages already present in `content.json` are kept as-is unless `force` is set,
+ * so re-running after a partial failure retries only the pages that failed
+ * rather than paying to read the whole book again.
  */
 export async function transcribeBook({
   asin,
@@ -72,8 +105,11 @@ export async function transcribeBook({
   model = DEFAULT_OCR_MODEL,
   requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   concurrency = DEFAULT_CONCURRENCY,
-  onProgress
-}: TranscribeBookOptions): Promise<ContentChunk[]> {
+  maxRetries = DEFAULT_MAX_RETRIES,
+  force = false,
+  onProgress,
+  client
+}: TranscribeBookOptions): Promise<TranscribeBookResult> {
   const outDir = path.join(root, asin)
   const metadata = await readJsonFile<BookMetadata>(
     path.join(outDir, 'metadata.json')
@@ -95,13 +131,31 @@ export async function transcribeBook({
   // const pageScreenshots = await globby(`${pageScreenshotsDir}/*.png`)
   // assert(pageScreenshots.length, 'no page screenshots found')
 
-  const openai = new OpenAIClient()
+  const openai = client ?? new OpenAIClient()
+  const contentPath = path.join(outDir, 'content.json')
+
+  // Keep whatever a previous run managed to read, so a retry only pays for the
+  // pages that actually failed.
+  const existing = force
+    ? []
+    : ((await tryReadJsonFile<ContentChunk[]>(contentPath)) ?? [])
+  const existingByIndex = new Map(
+    existing
+      .filter((chunk) => chunk?.text?.trim())
+      .map((chunk) => [chunk.index, chunk])
+  )
+
+  const pending = metadata.pages.filter(
+    (pageChunk) => !existingByIndex.has(pageChunk.index)
+  )
+  const failedPages: FailedPage[] = []
   let completed = 0
 
-  const content: ContentChunk[] = (
+  const transcribed: ContentChunk[] = (
     await pMap(
-      metadata.pages,
-      async (pageChunk, pageChunkIndex) => {
+      pending,
+      async (pageChunk) => {
+        const pageChunkIndex = metadata.pages.indexOf(pageChunk)
         const { screenshot, index, page } = pageChunk
         const screenshotBuffer = await fs.readFile(screenshot)
         const screenshotBase64 = `data:image/png;base64,${screenshotBuffer.toString('base64')}`
@@ -118,7 +172,6 @@ export async function transcribeBook({
         // )
 
         try {
-          const maxRetries = 20
           let retries = 0
 
           do {
@@ -226,22 +279,28 @@ Do not include any additional text, descriptions, or punctuation. Ignore any emb
               console.log(result)
             }
 
-            onProgress?.(++completed, metadata.pages.length)
+            onProgress?.(++completed, pending.length)
 
             return result
           } while (true)
         } catch (err) {
+          // Record rather than swallow: a dropped page leaves a hole in the
+          // book, and the caller has to be able to tell that from success.
+          const message = (err as Error)?.message ?? String(err)
           console.error(`error processing image ${index} (${screenshot})`, err)
+          failedPages.push({ index, page, screenshot, error: message })
+          onProgress?.(++completed, pending.length)
         }
       },
       { concurrency }
     )
-  ).filter(Boolean)
+  ).filter((chunk): chunk is ContentChunk => !!chunk)
 
-  await fs.writeFile(
-    path.join(outDir, 'content.json'),
-    JSON.stringify(content, null, 2)
+  const content = [...existingByIndex.values(), ...transcribed].toSorted(
+    (a, b) => a.index - b.index
   )
 
-  return content
+  await fs.writeFile(contentPath, JSON.stringify(content, null, 2))
+
+  return { content, failedPages }
 }

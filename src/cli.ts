@@ -79,6 +79,12 @@ const COMMANDS = new Set(['login', 'list', 'capture', 'ocr', 'export'])
 /** Above this many books, offer to filter before showing the picker. */
 const FILTER_PROMPT_THRESHOLD = 30
 
+/** Failed pages listed individually before collapsing to a count. */
+const MAX_REPORTED_FAILURES = 10
+
+/** Books that produced output but are missing pages. */
+const failedBooks = new Set<string>()
+
 function defaultProfileDir(): string {
   return path.join(os.homedir(), '.kindle-export', 'profile')
 }
@@ -372,11 +378,12 @@ async function ocr(
   }
 
   let lastReport = 0
-  const content = await transcribeBook({
+  const { content, failedPages } = await transcribeBook({
     asin,
     outDir: options.outDir,
     model: options.model,
     concurrency: options.concurrency,
+    force: options.forceOcr,
     onProgress: (done, total) => {
       // One line per 10%, so long books stay readable in a terminal.
       const step = Math.max(1, Math.floor(total / 10))
@@ -388,10 +395,25 @@ async function ocr(
   })
 
   assert(content.length, `[${asin}] transcription produced no text`)
-  if (content.length < metadata.pages.length) {
-    console.warn(
-      `[${asin}] warning: ${content.length} chunks for ${metadata.pages.length} page images`
+
+  if (failedPages.length) {
+    // The book is still worth exporting, but it has holes in it and the user
+    // has to know which pages, and that re-running will retry just those.
+    console.error(
+      `[${asin}] ${failedPages.length} of ${metadata.pages.length} pages could not be read:`
     )
+    for (const failure of failedPages.slice(0, MAX_REPORTED_FAILURES)) {
+      console.error(`  page ${failure.page} (${failure.error})`)
+    }
+    if (failedPages.length > MAX_REPORTED_FAILURES) {
+      console.error(
+        `  ...and ${failedPages.length - MAX_REPORTED_FAILURES} more`
+      )
+    }
+    console.error(
+      `[${asin}] the export below is missing those pages — re-run to retry just them`
+    )
+    failedBooks.add(asin)
   }
 
   return content
@@ -487,6 +509,16 @@ async function main() {
 
   if (failures.length) {
     console.error(`\n${failures.length} of ${options.asins.length} failed`)
+  }
+
+  if (failedBooks.size) {
+    console.error(
+      `${failedBooks.size} book(s) exported with missing pages: ${[...failedBooks].join(', ')}`
+    )
+  }
+
+  // Incomplete output is not success, even though a file was written.
+  if (failures.length || failedBooks.size) {
     process.exitCode = 1
   }
 }

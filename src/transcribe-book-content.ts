@@ -148,6 +148,21 @@ export async function transcribeBook({
   const pending = metadata.pages.filter(
     (pageChunk) => !existingByIndex.has(pageChunk.index)
   )
+  // Page images are cleaned up once a book is fully transcribed, so a missing
+  // one usually means "already done and tidied", not a broken install.
+  if (pending.length) {
+    const missing = await fs
+      .access(pending[0]!.screenshot)
+      .then(() => false)
+      .catch(() => true)
+
+    assert(
+      !missing,
+      `page images for ${asin} are gone (cleaned up after transcription). ` +
+        `Run 'kindle-export capture ${asin} --force-capture' to fetch them again.`
+    )
+  }
+
   const failedPages: FailedPage[] = []
   let completed = 0
 

@@ -5,9 +5,11 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { checkbox, input } from '@inquirer/prompts'
+import { checkbox, confirm, input, password } from '@inquirer/prompts'
 
 import type { BookMetadata, ContentChunk } from './types'
+import { cleanPageImages, cleanRenderData, formatBytes } from './cleanup'
+import { loadConfig, saveConfig } from './config'
 import { exportBookMarkdown } from './export-book-markdown'
 import { exportBookPdf } from './export-book-pdf'
 import { launchBrowserContext, runExtraction } from './extract-kindle-book'
@@ -20,10 +22,12 @@ const VERSION = '0.3.0'
 const HELP = `kindle-export — export Kindle books you own as markdown
 
 Usage
+  kindle-export setup                  store your API key and defaults
   kindle-export                        pick books from your library, then export
   kindle-export <ASIN...>              capture, transcribe and export (resumes)
   kindle-export login                  sign in to Amazon once, storing the session
   kindle-export list                   list the books in your Kindle library
+  kindle-export clean [ASIN...]        delete working files, keeping the text
   kindle-export capture <ASIN...>      capture page images only
   kindle-export ocr <ASIN...>          transcribe captured pages only
   kindle-export export <ASIN...>       render markdown from transcribed text only
@@ -42,16 +46,22 @@ Options
   --force-capture        redo page capture
   --force-ocr            redo transcription
   --force-export         redo markdown export
+  --keep-pages           keep page images instead of deleting them once
+                         every page has been transcribed
   -h, --help             show this help
   -v, --version          show the version
 
-Run 'kindle-export login' first and sign in in the browser window; the session
-is stored on this machine and never leaves it. OPENAI_API_KEY is required for
-transcription. AMAZON_EMAIL and AMAZON_PASSWORD are optional — set them only
-if you want sign-in scripted rather than doing it yourself.
+Run 'kindle-export setup' once to store your OpenAI key and defaults in
+~/.kindle-export/config.json, then 'kindle-export login' to sign in. The
+session stays on this machine. Settings can also come from flags or a .env
+file, which take precedence. AMAZON_EMAIL and AMAZON_PASSWORD are optional —
+set them only if you want sign-in scripted rather than doing it yourself.
+
+Page images are deleted once a book is fully transcribed, since re-capturing
+costs time rather than data. Pass --keep-pages to hold on to them.
 
 Examples
-  kindle-export login
+  kindle-export setup
   kindle-export                        pick from a menu of your books
   kindle-export list --json
   kindle-export B01H4G2J1U
@@ -69,12 +79,21 @@ interface Options {
   json: boolean
   limit?: number
   formats: Array<'md' | 'pdf'>
+  keepPages: boolean
   forceCapture: boolean
   forceOcr: boolean
   forceExport: boolean
 }
 
-const COMMANDS = new Set(['login', 'list', 'capture', 'ocr', 'export'])
+const COMMANDS = new Set([
+  'setup',
+  'login',
+  'list',
+  'clean',
+  'capture',
+  'ocr',
+  'export'
+])
 
 /** Above this many books, offer to filter before showing the picker. */
 const FILTER_PROMPT_THRESHOLD = 30
@@ -85,16 +104,33 @@ const MAX_REPORTED_FAILURES = 10
 /** Books that produced output but are missing pages. */
 const failedBooks = new Set<string>()
 
+/** Shown by `setup` as the suggested transcription model. */
+const DEFAULT_MODEL = 'gpt-4.1-mini'
+
+const EMPTY_OPTIONS: Options = {
+  command: 'all',
+  asins: [],
+  outDir: 'out',
+  profileDir: '',
+  json: false,
+  formats: ['md'],
+  keepPages: false,
+  forceCapture: false,
+  forceOcr: false,
+  forceExport: false
+}
+
 function defaultProfileDir(): string {
   return path.join(os.homedir(), '.kindle-export', 'profile')
 }
 
 function parseArgs(argv: string[]): Options | undefined {
   const positional: string[] = []
-  let outDir = getEnv('KINDLE_OUT_DIR') || 'out'
-  let profileDir = getEnv('BROWSER_PROFILE_DIR') || defaultProfileDir()
-  let model = getEnv('OCR_MODEL') || undefined
+  let outDir: string | undefined
+  let profileDir: string | undefined
+  let model: string | undefined
   let concurrency: number | undefined
+  let keepPages = false
   let otp: string | undefined
   let json = false
   let limit: number | undefined
@@ -169,6 +205,9 @@ function parseArgs(argv: string[]): Options | undefined {
       case '--force-export':
         forceExport = true
         break
+      case '--keep-pages':
+        keepPages = true
+        break
       default:
         assert(!arg.startsWith('-'), `unknown option: ${arg}`)
         positional.push(arg)
@@ -183,14 +222,15 @@ function parseArgs(argv: string[]): Options | undefined {
   return {
     command,
     asins: positional.map((asin) => asin.trim().toUpperCase()).filter(Boolean),
-    outDir,
-    profileDir,
+    outDir: outDir!,
+    profileDir: profileDir!,
     model,
     concurrency,
     otp,
     json,
     limit,
     formats,
+    keepPages,
     forceCapture: force || forceCapture,
     forceOcr: force || forceOcr,
     forceExport: force || forceExport
@@ -216,6 +256,131 @@ async function readContent(
   return tryReadJsonFile<ContentChunk[]>(
     path.join(outDir, asin, 'content.json')
   )
+}
+
+/**
+ * Fill in anything not given as a flag: environment (including `.env`) first,
+ * then stored config, then the built-in default.
+ */
+async function applyConfig(options: Options): Promise<Options> {
+  const stored = await loadConfig()
+
+  options.outDir =
+    options.outDir ?? getEnv('KINDLE_OUT_DIR') ?? stored.outDir ?? 'out'
+  options.profileDir =
+    options.profileDir ?? getEnv('BROWSER_PROFILE_DIR') ?? defaultProfileDir()
+  options.model = options.model ?? getEnv('OCR_MODEL') ?? stored.model
+  options.concurrency = options.concurrency ?? stored.concurrency
+
+  // The transcriber reads the key from the environment, so put the stored one
+  // there when nothing else supplied it.
+  if (!getEnv('OPENAI_API_KEY') && stored.openaiApiKey) {
+    // eslint-disable-next-line no-process-env
+    process.env.OPENAI_API_KEY = stored.openaiApiKey
+  }
+
+  return options
+}
+
+async function setup(): Promise<void> {
+  const stored = await loadConfig()
+
+  console.log('Settings are stored in your home directory, so kindle-export')
+  console.log('works from any folder. Press enter to keep a current value.\n')
+
+  const openaiApiKey =
+    (await password({
+      message: stored.openaiApiKey
+        ? 'OpenAI API key (enter to keep existing):'
+        : 'OpenAI API key:',
+      mask: '*'
+    })) || stored.openaiApiKey
+
+  const model = await input({
+    message: 'Model used to read page images:',
+    default: stored.model ?? DEFAULT_MODEL
+  })
+
+  const outDir = await input({
+    message: 'Where should books be written?',
+    default: stored.outDir ?? 'out'
+  })
+
+  const target = await saveConfig({
+    ...stored,
+    openaiApiKey: openaiApiKey || undefined,
+    model: model.trim() || undefined,
+    outDir: outDir.trim() || undefined
+  })
+
+  console.log(`\nSaved to ${target} (readable only by you).`)
+
+  if (!openaiApiKey) {
+    console.log('No API key stored — transcription will not work until one is.')
+  }
+
+  const wantsLogin = await confirm({
+    message: 'Sign in to Amazon now?',
+    default: true
+  })
+  if (wantsLogin) {
+    await login(await applyConfig({ ...EMPTY_OPTIONS, command: 'login' }))
+  }
+}
+
+async function clean(options: Options): Promise<void> {
+  const asins = options.asins.length
+    ? options.asins
+    : await listBookDirs(options.outDir)
+
+  if (!asins.length) {
+    console.log(`No books found in ${options.outDir}`)
+    return
+  }
+
+  let freed = 0
+  for (const asin of asins) {
+    const render = await cleanRenderData(options.outDir, asin)
+    freed += render.freed
+
+    // Page images only go when the text is complete, otherwise a retry
+    // silently becomes a re-capture.
+    let pages = { freed: 0, removed: [] as string[] }
+    if (!options.keepPages) {
+      const content = await readContent(options.outDir, asin)
+      const metadata = await readMetadata(options.outDir, asin)
+      const complete =
+        !!content?.length &&
+        !!metadata?.pages?.length &&
+        content.length >= metadata.pages.length
+
+      if (complete) {
+        pages = await cleanPageImages(options.outDir, asin)
+      } else if (content?.length) {
+        console.log(
+          `[${asin}] keeping page images: transcription is incomplete`
+        )
+      }
+    }
+
+    freed += pages.freed
+    if (render.freed || pages.freed) {
+      console.log(`[${asin}] freed ${formatBytes(render.freed + pages.freed)}`)
+    }
+  }
+
+  console.log(`\nFreed ${formatBytes(freed)} in total.`)
+}
+
+async function listBookDirs(outDir: string): Promise<string[]> {
+  const entries = await fs
+    .readdir(outDir, { withFileTypes: true })
+    .catch(() => [])
+
+  return entries
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+    .map((entry) => entry.name)
+    .toSorted()
 }
 
 /** Open a browser so the user can sign in once; the session persists after. */
@@ -359,6 +524,14 @@ async function capture(asin: string, options: Options): Promise<BookMetadata> {
   assert(metadata?.pages?.length, `[${asin}] capture produced no page images`)
   console.log(`[${asin}] capture: ${metadata.pages.length} page images`)
 
+  // Amazon's render payloads are only useful during the capture itself.
+  const render = await cleanRenderData(options.outDir, asin)
+  if (render.freed) {
+    console.log(
+      `[${asin}] capture: freed ${formatBytes(render.freed)} of render data`
+    )
+  }
+
   return metadata
 }
 
@@ -414,6 +587,17 @@ async function ocr(
       `[${asin}] the export below is missing those pages — re-run to retry just them`
     )
     failedBooks.add(asin)
+  }
+
+  // Page images are only the input to this step. Once every page has text
+  // they're dead weight, and re-capturing costs time rather than data.
+  if (!options.keepPages && !failedPages.length) {
+    const pages = await cleanPageImages(options.outDir, asin)
+    if (pages.freed) {
+      console.log(
+        `[${asin}] transcribe: freed ${formatBytes(pages.freed)} of page images`
+      )
+    }
   }
 
   return content
@@ -479,6 +663,18 @@ async function main() {
   }
 
   if (!options) return
+
+  if (options.command === 'setup') {
+    await setup()
+    return
+  }
+
+  options = await applyConfig(options)
+
+  if (options.command === 'clean') {
+    await clean(options)
+    return
+  }
 
   if (options.command === 'login') {
     await login(options)

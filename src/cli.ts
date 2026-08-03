@@ -5,9 +5,12 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
+import { checkbox } from '@inquirer/prompts'
+
 import type { BookMetadata, ContentChunk } from './types'
 import { exportBookMarkdown } from './export-book-markdown'
 import { launchBrowserContext, runExtraction } from './extract-kindle-book'
+import { fetchLibrary, type LibraryBook } from './kindle-library'
 import { transcribeBook } from './transcribe-book-content'
 import { assert, getEnv, tryReadJsonFile } from './utils'
 
@@ -16,13 +19,17 @@ const VERSION = '0.3.0'
 const HELP = `kindle-export — export Kindle books you own as markdown
 
 Usage
+  kindle-export                        pick books from your library, then export
   kindle-export <ASIN...>              capture, transcribe and export (resumes)
   kindle-export login                  sign in to Amazon once, storing the session
+  kindle-export list                   list the books in your Kindle library
   kindle-export capture <ASIN...>      capture page images only
   kindle-export ocr <ASIN...>          transcribe captured pages only
   kindle-export export <ASIN...>       render markdown from transcribed text only
 
 Options
+  --json                 with 'list', print JSON instead of a table
+  --limit <n>            with 'list', stop after this many books
   --out-dir <dir>        where books are written (default: ./out)
   --profile-dir <dir>    browser profile holding your session
                          (default: ~/.kindle-export/profile)
@@ -42,6 +49,8 @@ session is stored on this machine and never leaves it.
 
 Examples
   kindle-export login
+  kindle-export                        pick from a menu of your books
+  kindle-export list --json
   kindle-export B01H4G2J1U
   kindle-export B01H4G2J1U B07PPW5V9C --force-ocr
   kindle-export ocr B01H4G2J1U --model gpt-5-mini`
@@ -54,12 +63,14 @@ interface Options {
   model?: string
   concurrency?: number
   otp?: string
+  json: boolean
+  limit?: number
   forceCapture: boolean
   forceOcr: boolean
   forceExport: boolean
 }
 
-const COMMANDS = new Set(['login', 'capture', 'ocr', 'export'])
+const COMMANDS = new Set(['login', 'list', 'capture', 'ocr', 'export'])
 
 function defaultProfileDir(): string {
   return path.join(os.homedir(), '.kindle-export', 'profile')
@@ -72,6 +83,8 @@ function parseArgs(argv: string[]): Options | undefined {
   let model = getEnv('OCR_MODEL') || undefined
   let concurrency: number | undefined
   let otp: string | undefined
+  let json = false
+  let limit: number | undefined
   let force = false
   let forceCapture = false
   let forceOcr = false
@@ -109,6 +122,12 @@ function parseArgs(argv: string[]): Options | undefined {
       case '--otp':
         otp = next()
         break
+      case '--json':
+        json = true
+        break
+      case '--limit':
+        limit = Number.parseInt(next(), 10)
+        break
       case '--force':
         force = true
         break
@@ -141,6 +160,8 @@ function parseArgs(argv: string[]): Options | undefined {
     model,
     concurrency,
     otp,
+    json,
+    limit,
     forceCapture: force || forceCapture,
     forceOcr: force || forceOcr,
     forceExport: force || forceExport
@@ -185,6 +206,79 @@ async function login(options: Options): Promise<void> {
   })
 
   console.log('Session saved. You can now run: kindle-export <ASIN>')
+}
+
+/** Read the library, always closing the browser afterwards. */
+async function withLibrary(options: Options): Promise<LibraryBook[]> {
+  const context = await launchBrowserContext({ profileDir: options.profileDir })
+
+  try {
+    return await fetchLibrary(context, { limit: options.limit })
+  } finally {
+    await context.close().catch(() => {})
+    await context
+      .browser()
+      ?.close()
+      .catch(() => {})
+  }
+}
+
+function formatBookLine(book: LibraryBook): string {
+  const authors = book.authors.length ? ` — ${book.authors.join(', ')}` : ''
+  const progress =
+    typeof book.percentageRead === 'number' && book.percentageRead > 0
+      ? ` (${Math.round(book.percentageRead)}% read)`
+      : ''
+
+  return `${book.title}${authors}${progress}`
+}
+
+async function list(options: Options): Promise<void> {
+  const books = await withLibrary(options)
+
+  if (options.json) {
+    console.log(JSON.stringify(books, null, 2))
+    return
+  }
+
+  if (!books.length) {
+    console.log('No books found in your Kindle library.')
+    return
+  }
+
+  for (const book of books) {
+    console.log(`${book.asin}  ${formatBookLine(book)}`)
+  }
+
+  console.log(`\n${books.length} book${books.length === 1 ? '' : 's'}`)
+}
+
+/** Let the user pick books from their library when they named none. */
+async function selectFromLibrary(options: Options): Promise<string[]> {
+  console.log('Reading your Kindle library…')
+  const books = await withLibrary(options)
+
+  if (!books.length) {
+    console.log('No books found in your Kindle library.')
+    return []
+  }
+
+  if (!process.stdin.isTTY) {
+    console.error(
+      'No ASINs given and no terminal to prompt on. Pass ASINs directly, or run: kindle-export list'
+    )
+    process.exitCode = 1
+    return []
+  }
+
+  return checkbox({
+    message: `Select books to export (${books.length} in your library)`,
+    pageSize: 15,
+    choices: books.map((book) => ({
+      name: `${formatBookLine(book)}  [${book.asin}]`,
+      value: book.asin
+    }))
+  })
 }
 
 async function capture(asin: string, options: Options): Promise<BookMetadata> {
@@ -318,10 +412,16 @@ async function main() {
     return
   }
 
-  if (!options.asins.length) {
-    console.log(HELP)
-    process.exitCode = 1
+  if (options.command === 'list') {
+    await list(options)
     return
+  }
+
+  if (!options.asins.length) {
+    // Naming no book is a request to choose one, not a usage error — the whole
+    // point is not having to look ASINs up by hand.
+    options.asins = await selectFromLibrary(options)
+    if (!options.asins.length) return
   }
 
   const failures: string[] = []

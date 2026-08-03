@@ -5,8 +5,12 @@ machine — your Amazon session never leaves it.
 
 ```bash
 kindle-export login          # once
-kindle-export B01H4G2J1U     # capture → transcribe → markdown
+kindle-export                # pick books from your library, then export
 ```
+
+No need to hunt for ASINs — running it with no arguments reads your Kindle
+library and shows a menu you can select one or many books from. If you already
+know the ASIN, pass it directly: `kindle-export B01H4G2J1U`.
 
 ## How it works
 
@@ -48,17 +52,24 @@ kindle-export login
 ## Usage
 
 ```
+kindle-export                        pick books from your library, then export
 kindle-export <ASIN...>              capture, transcribe and export
 kindle-export login                  sign in once, storing the session
+kindle-export list                   list the books in your Kindle library
 kindle-export capture <ASIN...>      capture page images only
 kindle-export ocr <ASIN...>          transcribe captured pages only
 kindle-export export <ASIN...>       render markdown from transcribed text only
 ```
 
-Useful options: `--out-dir`, `--profile-dir`, `--model`, `--concurrency`,
-`--otp`, `--force`. Run `kindle-export --help` for the full list.
+Useful options: `--json` and `--limit` for `list`, plus `--out-dir`,
+`--profile-dir`, `--model`, `--concurrency`, `--otp` and `--force`. Run
+`kindle-export --help` for the full list.
 
-The ASIN is in the Amazon URL for the book — `.../dp/B01H4G2J1U`.
+`list` reads the same internal JSON endpoint the Kindle library page uses, so
+it sees everything in your account and pages through it. Piping `--json`
+elsewhere is the easy way to script a bulk export.
+
+The ASIN is also in the Amazon URL for a book — `.../dp/B01H4G2J1U`.
 
 ## Output
 

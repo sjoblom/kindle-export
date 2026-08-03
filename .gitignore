@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Credentials — never commit these
+.env
+.env.*
+!.env.example
+
+# Browser profiles hold a live, authenticated Amazon session
+.browser-profile*/
+profiles/
+
+# Book output: page screenshots and transcribed text are copyrighted material
+out/
+output/
+*.md.bak
+
+# Local scratch
+.venv/
+__pycache__/
+.DS_Store
+coverage/

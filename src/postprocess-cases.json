@@ -1,0 +1,110 @@
+{
+  "_comment": "Shared contract between postprocess-text.ts and kindle_postprocess.py. Both test suites assert against this file, so a change to either implementation alone breaks its own tests. formatText cases compare formatContentChunks(chunks, {detectHeadings: false}) against '\\n\\n'.join(r['text'] for r in normalize_content(chunks)).",
+  "isHeading": [
+    { "line": "FAILING THE MOM TEST", "expected": true },
+    { "line": "WHY ANOTHER BOOK ON TALKING AND SELLING?", "expected": true },
+    { "line": "CHAPTER 1", "expected": true },
+    { "line": "A NOTE ON SCOPE & TERMINOLOGY", "expected": true },
+    { "line": "CONTENTS", "expected": true },
+    { "line": "People say you shouldn't ask your mom.", "expected": false },
+    { "line": "THE MOM TEST is a set of simple rules.", "expected": false },
+    { "line": "MOM,", "expected": false },
+    { "line": "SUMMARY:", "expected": false },
+    { "line": "1984", "expected": false },
+    { "line": "* * *", "expected": false },
+    { "line": "I", "expected": false },
+    { "line": "", "expected": false },
+    {
+      "line": "A HEADING THAT IS FAR TOO LONG TO PLAUSIBLY BE A SECTION TITLE IN ANY BOOK",
+      "expected": false
+    }
+  ],
+  "continuesParagraph": [
+    { "prev": "To keep the", "next": "distinction clear", "expected": true },
+    { "prev": "I had been talking to", "next": "customers", "expected": true },
+    { "prev": "a comma,", "next": "then more", "expected": true },
+    { "prev": "Run the process", "next": "Conclusion", "expected": false },
+    { "prev": "That was the end.", "next": "she left.", "expected": false },
+    { "prev": "That was the end.", "next": "She left.", "expected": false },
+    { "prev": "", "next": "anything", "expected": false },
+    { "prev": "something", "next": "", "expected": false }
+  ],
+  "formatText": [
+    {
+      "name": "rejoins a paragraph split across a page boundary",
+      "chunks": [
+        [1, "shouldn't be confused with the whole process. To keep the"],
+        [2, "distinction clear, I am going to refer to chatting."]
+      ],
+      "expected": "shouldn't be confused with the whole process. To keep the distinction clear, I am going to refer to chatting."
+    },
+    {
+      "name": "leaves unrelated paragraphs alone",
+      "chunks": [
+        [1, "8. Running the process"],
+        [2, "Conclusion and cheatsheet"]
+      ],
+      "expected": "8. Running the process\n\nConclusion and cheatsheet"
+    },
+    {
+      "name": "keeps paragraphs within a page separate",
+      "chunks": [[1, "First para\nsecond para"]],
+      "expected": "First para\n\nsecond para"
+    },
+    {
+      "name": "only the last paragraph of a page can continue",
+      "chunks": [
+        [1, "ends mid\nand this one also ends mid"],
+        [2, "sentence."]
+      ],
+      "expected": "ends mid\n\nand this one also ends mid sentence."
+    },
+    {
+      "name": "joins without a space after a dash",
+      "chunks": [
+        [1, "he said—"],
+        [2, "well, maybe."]
+      ],
+      "expected": "he said—well, maybe."
+    },
+    {
+      "name": "headings stay as their own blocks",
+      "chunks": [[1, "FAILING THE MOM TEST\nSon: a question."]],
+      "expected": "FAILING THE MOM TEST\n\nSon: a question."
+    },
+    {
+      "name": "a heading interrupts a would-be continuation",
+      "chunks": [
+        [1, "this sentence runs on"],
+        [2, "FAILING THE MOM TEST\nand this is new."]
+      ],
+      "expected": "this sentence runs on\n\nFAILING THE MOM TEST\n\nand this is new."
+    },
+    {
+      "name": "ignores empty and whitespace-only chunks",
+      "chunks": [
+        [1, "Body."],
+        [2, "   \n  "],
+        [3, ""]
+      ],
+      "expected": "Body."
+    },
+    {
+      "name": "chains a continuation across three pages",
+      "chunks": [
+        [1, "one part"],
+        [2, "another part"],
+        [3, "and the end."]
+      ],
+      "expected": "one part another part and the end."
+    },
+    {
+      "name": "does not join when the next page opens on a capital",
+      "chunks": [
+        [1, "the sentence ends here"],
+        [2, "Later text begins."]
+      ],
+      "expected": "the sentence ends here\n\nLater text begins."
+    }
+  ]
+}

@@ -20,7 +20,6 @@
   "scripts": {
     "build": "tsup",
     "kindle-export": "tsx src/cli.ts",
-    "extract:illustrations": "tsx src/extract-illustrations.ts",
     "test": "run-s test:*",
     "test:format": "prettier --check \"**/*.{js,ts,tsx}\"",
     "test:lint": "eslint .",

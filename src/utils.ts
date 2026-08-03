@@ -52,6 +52,17 @@ export function normalizeAuthors(rawAuthors: string[]): string[] {
   )
 }
 
+/**
+ * Escape a string for literal use inside a RegExp.
+ *
+ * Book metadata is full of strings that are also regex syntax — a TOC label
+ * like "C++ Primer" is a syntax error, and "Chapter 1 (cont.)" quietly matches
+ * something other than itself.
+ */
+export function escapeRegExp(str: string): string {
+  return str.replaceAll(/[$()*+.?[\\\]^{|}]/g, String.raw`\$&`)
+}
+
 const JSONP_REGEX = /\(({.*})\)/
 
 export function parseJsonpResponse<T = unknown>(body: string): T | undefined {
@@ -181,6 +192,7 @@ const bookMetadataFieldOrder: (keyof BookMetadata)[] = [
   'meta',
   'info',
   'nav',
+  'capture',
   'toc',
   'pages',
   'locationMap'

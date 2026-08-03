@@ -5,7 +5,41 @@ export interface BookMetadata {
   toc: TocItem[]
   pages: PageChunk[]
   locationMap: AmazonRenderLocationMap
+  /**
+   * How the capture ended. Absent on books captured before this was recorded,
+   * which are assumed complete rather than forcing a re-capture of a library.
+   */
+  capture?: CaptureStatus
 }
+
+/**
+ * Whether `pages` is the whole book.
+ *
+ * A capture can stop early — the reader stops responding to the next-page
+ * chevron, or the run is interrupted — and the pages written up to that point
+ * look exactly like a finished book. Without this, a truncated capture is
+ * reused forever and exports cleanly with the tail of the book missing.
+ */
+export interface CaptureStatus {
+  complete: boolean
+  reason: CaptureStopReason
+  /** Last page reached, to report how much of the book is missing. */
+  lastPage: number
+  /** Content pages the book claims to have. */
+  totalContentPages: number
+}
+
+export type CaptureStopReason =
+  /** Footer nav reported the last page. */
+  | 'end-of-book'
+  /** Walked past the last content page. */
+  | 'past-last-content-page'
+  /** The reader stopped advancing. */
+  | 'navigation-failed'
+  /** Page position became unreadable mid-book. */
+  | 'no-page-nav'
+  /** Metadata written mid-capture; the run never reached an end state. */
+  | 'interrupted'
 
 export interface Nav {
   startPosition: number // inclusive

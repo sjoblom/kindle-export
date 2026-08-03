@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 import 'dotenv/config'
 
+import { realpathSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { checkbox, confirm, input, password } from '@inquirer/prompts'
 
 import type { BookMetadata, ContentChunk } from './types'
+import { describeIncompleteCapture } from './capture-status'
 import { cleanPageImages, cleanRenderData, formatBytes } from './cleanup'
 import { loadConfig, saveConfig } from './config'
 import { exportBookMarkdown } from './export-book-markdown'
@@ -68,7 +71,7 @@ Examples
   kindle-export B01H4G2J1U B07PPW5V9C --force-ocr
   kindle-export ocr B01H4G2J1U --model gpt-5-mini`
 
-interface Options {
+export interface Options {
   command: string
   asins: string[]
   outDir: string
@@ -100,6 +103,7 @@ const FILTER_PROMPT_THRESHOLD = 30
 
 /** Failed pages listed individually before collapsing to a count. */
 const MAX_REPORTED_FAILURES = 10
+const ASIN_REGEX = /^[A-Z0-9]+$/
 
 /** Books that produced output but are missing pages. */
 const failedBooks = new Set<string>()
@@ -107,10 +111,11 @@ const failedBooks = new Set<string>()
 /** Shown by `setup` as the suggested transcription model. */
 const DEFAULT_MODEL = 'gpt-4.1-mini'
 
+/** Nothing supplied by hand; applyConfig fills every path in. */
 const EMPTY_OPTIONS: Options = {
   command: 'all',
   asins: [],
-  outDir: 'out',
+  outDir: '',
   profileDir: '',
   json: false,
   formats: ['md'],
@@ -124,7 +129,7 @@ function defaultProfileDir(): string {
   return path.join(os.homedir(), '.kindle-export', 'profile')
 }
 
-function parseArgs(argv: string[]): Options | undefined {
+export function parseArgs(argv: string[]): Options | undefined {
   const positional: string[] = []
   let outDir: string | undefined
   let profileDir: string | undefined
@@ -219,9 +224,19 @@ function parseArgs(argv: string[]): Options | undefined {
       ? positional.shift()!.toLowerCase()
       : 'all'
 
+  const asins = positional
+    .map((asin) => asin.trim().toUpperCase())
+    .filter(Boolean)
+  for (const asin of asins) {
+    // An ASIN is alphanumeric, and it's also used as a directory name — so
+    // without this, a typo like `clean ..` resolves outside the book folder and
+    // deletes something that has nothing to do with the export.
+    assert(ASIN_REGEX.test(asin), `invalid ASIN: ${asin}`)
+  }
+
   return {
     command,
-    asins: positional.map((asin) => asin.trim().toUpperCase()).filter(Boolean),
+    asins,
     outDir: outDir!,
     profileDir: profileDir!,
     model,
@@ -262,13 +277,16 @@ async function readContent(
  * Fill in anything not given as a flag: environment (including `.env`) first,
  * then stored config, then the built-in default.
  */
-async function applyConfig(options: Options): Promise<Options> {
+export async function applyConfig(options: Options): Promise<Options> {
   const stored = await loadConfig()
 
+  // `||`, not `??`: a blank path means "not supplied" — `setup` builds options
+  // by hand rather than through parseArgs, and an empty string there used to
+  // survive all the way to `mkdir ''`.
   options.outDir =
-    options.outDir ?? getEnv('KINDLE_OUT_DIR') ?? stored.outDir ?? 'out'
+    options.outDir || getEnv('KINDLE_OUT_DIR') || stored.outDir || 'out'
   options.profileDir =
-    options.profileDir ?? getEnv('BROWSER_PROFILE_DIR') ?? defaultProfileDir()
+    options.profileDir || getEnv('BROWSER_PROFILE_DIR') || defaultProfileDir()
   options.model = options.model ?? getEnv('OCR_MODEL') ?? stored.model
   options.concurrency = options.concurrency ?? stored.concurrency
 
@@ -499,12 +517,29 @@ async function selectFromLibrary(options: Options): Promise<string[]> {
   })
 }
 
+/**
+ * Say so when the pages on disk are only part of a book.
+ *
+ * Truncated captures look identical to finished ones — a shorter book — so
+ * without this a run that died at chapter 3 exports cleanly and silently.
+ */
+function reportIncompleteCapture(asin: string, metadata: BookMetadata): void {
+  const lines = describeIncompleteCapture(metadata)
+  if (!lines) return
+
+  for (const line of lines) {
+    console.error(`[${asin}] ${line}`)
+  }
+  failedBooks.add(asin)
+}
+
 async function capture(asin: string, options: Options): Promise<BookMetadata> {
   const existing = await readMetadata(options.outDir, asin)
   if (!options.forceCapture && existing?.pages?.length) {
     console.log(
       `[${asin}] capture: reusing ${existing.pages.length} existing page images`
     )
+    reportIncompleteCapture(asin, existing)
     return existing
   }
 
@@ -523,6 +558,7 @@ async function capture(asin: string, options: Options): Promise<BookMetadata> {
   const metadata = await readMetadata(options.outDir, asin)
   assert(metadata?.pages?.length, `[${asin}] capture produced no page images`)
   console.log(`[${asin}] capture: ${metadata.pages.length} page images`)
+  reportIncompleteCapture(asin, metadata)
 
   // Amazon's render payloads are only useful during the capture itself.
   const render = await cleanRenderData(options.outDir, asin)
@@ -719,4 +755,26 @@ async function main() {
   }
 }
 
-await main()
+/**
+ * Whether this module was launched directly, rather than imported.
+ *
+ * npm installs `bin` entries as symlinks, so the launched path and this
+ * module's own path are different files on disk until both are resolved —
+ * compare them raw and a globally installed `kindle-export` does nothing at
+ * all. Anything unresolvable falls through to running: a CLI that runs when it
+ * shouldn't is a test artefact, one that silently exits is a broken install.
+ */
+function isDirectEntryPoint(): boolean {
+  const entry = process.argv[1]
+  if (!entry) return false
+
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return true
+  }
+}
+
+if (isDirectEntryPoint()) {
+  await main()
+}

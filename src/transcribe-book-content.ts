@@ -7,12 +7,20 @@ import { OpenAIClient } from 'openai-fetch'
 import pMap from 'p-map'
 
 import type { BookMetadata, ContentChunk, TocItem } from './types'
-import { assert, getEnv, readJsonFile, tryReadJsonFile } from './utils'
+import {
+  assert,
+  escapeRegExp,
+  getEnv,
+  readJsonFile,
+  tryReadJsonFile
+} from './utils'
 
 const DEFAULT_OCR_MODEL = 'gpt-4.1-mini'
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
 const DEFAULT_CONCURRENCY = 16
 const DEFAULT_MAX_RETRIES = 20
+/** Attempts at an empty response before accepting the page really is blank. */
+const EMPTY_RESPONSE_RETRIES = 3
 const REFUSAL_REGEX =
   /\b(i('| a)?m sorry|can't help|cannot help|cannot comply|unable to|policy)\b/i
 const VERBOSE_LOGGING = getEnv('KINDLE_EXPORT_VERBOSE') === '1'
@@ -139,9 +147,12 @@ export async function transcribeBook({
   const existing = force
     ? []
     : ((await tryReadJsonFile<ContentChunk[]>(contentPath)) ?? [])
+  // A blank page reads as an empty string, which is a real answer and not worth
+  // paying to re-read on every subsequent run. Chunks with no text field at all
+  // are junk and get retried.
   const existingByIndex = new Map(
     existing
-      .filter((chunk) => chunk?.text?.trim())
+      .filter((chunk) => typeof chunk?.text === 'string')
       .map((chunk) => [chunk.index, chunk])
   )
 
@@ -242,7 +253,7 @@ Do not include any additional text, descriptions, or punctuation. Ignore any emb
               continue
             }
 
-            const rawText = res.choices[0]!.message.content!
+            const rawText = res.choices[0]?.message?.content ?? ''
             let text = rawText
               .replace(/^\s*\d+\s*$\n+/m, '')
               // .replaceAll(/\n+/g, '\n')
@@ -251,7 +262,23 @@ Do not include any additional text, descriptions, or punctuation. Ignore any emb
 
             ++retries
 
-            if (!text) continue
+            // Nothing came back. Retry a couple of times in case the model just
+            // hiccuped, then take it at its word: blank pages are ordinary in a
+            // book, and an empty page is the honest transcription of one.
+            // Failing it instead would mark the book permanently incomplete and
+            // keep its page images from ever being cleaned up.
+            if (
+              !text &&
+              retries < Math.min(EMPTY_RESPONSE_RETRIES, maxRetries)
+            ) {
+              await sleep(Math.min(2000, 200 * 2 ** retries))
+              continue
+            }
+
+            if (!text) {
+              console.warn('treating page as blank', { index, screenshot })
+            }
+
             if (text.length < 200 && REFUSAL_REGEX.test(text)) {
               if (retries >= maxRetries) {
                 throw new Error(
@@ -278,7 +305,7 @@ Do not include any additional text, descriptions, or punctuation. Ignore any emb
               if (tocItem) {
                 text = text.replace(
                   // eslint-disable-next-line security/detect-non-literal-regexp
-                  new RegExp(`^${tocItem.label}\\s*`, 'i'),
+                  new RegExp(`^${escapeRegExp(tocItem.label)}\\s*`, 'i'),
                   ''
                 )
               }

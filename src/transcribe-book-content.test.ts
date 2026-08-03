@@ -15,7 +15,12 @@ const ASIN = 'B000TEST01'
 let root: string
 
 /** A book with `pageCount` captured pages, on disk. */
-async function writeBook(pageCount: number): Promise<void> {
+async function writeBook(
+  pageCount: number,
+  toc: Array<{ label: string; page: number }> = [
+    { label: 'Chapter One', page: 1 }
+  ]
+): Promise<void> {
   const outDir = path.join(root, ASIN)
   await fs.mkdir(path.join(outDir, 'pages'), { recursive: true })
 
@@ -29,7 +34,7 @@ async function writeBook(pageCount: number): Promise<void> {
 
   const metadata: Partial<BookMetadata> = {
     pages,
-    toc: [{ label: 'Chapter One', page: 1, positionId: 0, depth: 0 }] as any
+    toc: toc.map((item, i) => ({ ...item, positionId: i, depth: 0 })) as any
   }
 
   await fs.writeFile(
@@ -143,6 +148,81 @@ describe('transcribeBook', () => {
 
     expect(content[0]!.text).toBe('the real page text')
     expect(client.calls).toBe(2)
+  })
+
+  it('accepts a blank page instead of retrying it forever', async () => {
+    await writeBook(1)
+
+    const client = fakeClient(() => '')
+    const { content, failedPages } = await transcribeBook({
+      asin: ASIN,
+      outDir: root,
+      client
+    })
+
+    // Books have blank pages, and an empty transcription is the right answer
+    // for one. The bound is what matters: an unbounded retry here is an
+    // unbounded bill.
+    expect(client.calls).toBe(3)
+    expect(failedPages).toEqual([])
+    expect(content).toHaveLength(1)
+    expect(content[0]!.text).toBe('')
+  })
+
+  it('treats a whitespace-only reply as blank, not as text', async () => {
+    await writeBook(1)
+
+    const client = fakeClient(() => '  \n \t \n ')
+    const { content, failedPages } = await transcribeBook({
+      asin: ASIN,
+      outDir: root,
+      maxRetries: 1,
+      client
+    })
+
+    expect(client.calls).toBe(1)
+    expect(failedPages).toEqual([])
+    expect(content[0]!.text).toBe('')
+  })
+
+  it('keeps a blank page rather than paying to re-read it', async () => {
+    await writeBook(2)
+
+    await transcribeBook({
+      asin: ASIN,
+      outDir: root,
+      maxRetries: 1,
+      client: fakeClient((i) => (i === 0 ? '' : 'page two'))
+    })
+
+    const client = fakeClient(() => 'should not be called')
+    const { content } = await transcribeBook({
+      asin: ASIN,
+      outDir: root,
+      client
+    })
+
+    expect(client.calls).toBe(0)
+    expect(content.map((c) => c.text)).toEqual(['', 'page two'])
+  })
+
+  it('strips a TOC heading whose label is also regex syntax', async () => {
+    await writeBook(2, [{ label: 'C++ Primer (2nd ed.)', page: 2 }])
+
+    const client = fakeClient((i) =>
+      i === 0 ? 'page one' : 'C++ Primer (2nd ed.) and then the body text'
+    )
+    const { content, failedPages } = await transcribeBook({
+      asin: ASIN,
+      outDir: root,
+      concurrency: 1,
+      client
+    })
+
+    // Unescaped, this label is an invalid regex and the page dies after a paid
+    // request; a label like "Chapter 1 (cont.)" would silently mis-match.
+    expect(failedPages).toEqual([])
+    expect(content[1]!.text).toBe('and then the body text')
   })
 
   it('reuses already-transcribed pages and retries only what is missing', async () => {

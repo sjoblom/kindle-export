@@ -16,6 +16,7 @@ import type {
   AmazonRenderToc,
   AmazonRenderTocItem,
   BookMetadata,
+  CaptureStatus,
   PageNav,
   TocItem
 } from './types'
@@ -101,6 +102,16 @@ async function cleanupStaleSingletonLocks(profileDir: string) {
   }
 }
 
+/** Signal 0 checks for the process without touching it. */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function ensureBrowserProfileAvailable(profileDir: string) {
   const lockPath = path.join(profileDir, 'SingletonLock')
   const linkTarget = await fs.readlink(lockPath).catch(() => undefined)
@@ -118,13 +129,7 @@ async function ensureBrowserProfileAvailable(profileDir: string) {
     return
   }
 
-  let isRunning = false
-  try {
-    process.kill(pid, 0)
-    isRunning = true
-  } catch {}
-
-  if (!isRunning) {
+  if (!isProcessAlive(pid)) {
     await cleanupStaleSingletonLocks(profileDir)
     return
   }
@@ -137,18 +142,19 @@ async function ensureBrowserProfileAvailable(profileDir: string) {
   } catch {}
   await delay(500)
 
-  try {
-    process.kill(pid, 0)
-    process.kill(pid, 'SIGKILL')
+  if (isProcessAlive(pid)) {
+    try {
+      process.kill(pid, 'SIGKILL')
+    } catch {}
     await delay(250)
-  } catch {}
+  }
 
-  try {
-    process.kill(pid, 0)
-    throw new Error(
-      `shared browser profile is still locked by pid ${pid}; close that browser and retry`
-    )
-  } catch {}
+  // Removing the locks while something still holds the profile hands Chrome a
+  // directory another process is writing to. Better to stop here and say so.
+  assert(
+    !isProcessAlive(pid),
+    `shared browser profile is still locked by pid ${pid}; close that browser and retry`
+  )
 
   await cleanupStaleSingletonLocks(profileDir)
 }
@@ -325,6 +331,29 @@ export async function extractBook(
   const page = await context.newPage()
 
   try {
+    // Kindle's "Most Recent Page Read" dialog appears when the book content
+    // finishes loading — which races with everything else — and until it's
+    // answered its overlay swallows every click, so an action just retries
+    // until it times out. A locator handler is the reliable way to deal with
+    // that: Playwright runs it whenever the dialog is in the way, whatever
+    // else we happen to be doing. We always start from the beginning of the
+    // book, so the answer is always No.
+    await page.addLocatorHandler(
+      page
+        .locator('ion-alert, [role="dialog"], .alert-wrapper')
+        .filter({ hasText: /most recent page read/i })
+        .first(),
+      async (dialog) => {
+        warnInfo('dismissing "Most Recent Page Read" dialog')
+        await dialog
+          .locator('button, ion-button')
+          .filter({ hasText: /^\s*no\s*$/i })
+          .first()
+          .click({ force: true })
+          .catch(() => {})
+      }
+    )
+
     await page.route('**/*', async (route) => {
       const urlString = route.request().url()
       for (const regex of urlRegexBlacklist) {
@@ -600,12 +629,16 @@ export async function extractBook(
       await delay(200)
 
       logInfo('Closing settings')
+      // The sync dialog can surface while the settings panel is open, and it
+      // swallows this click — leaving the panel covering the page image.
+      await dismissPossibleAlert()
       await settingsButton.click()
       await delay(500)
       await dismissReaderPopoverMenu()
     }
 
     async function goToPage(pageNumber: number) {
+      await dismissPossibleAlert()
       await dismissReaderPopoverMenu()
       await page.locator('#reader-header').hover({ force: true })
       await delay(200)
@@ -649,10 +682,13 @@ export async function extractBook(
       await delay(1000)
       await dismissReaderPopoverMenu()
 
-      const nextPageNav = await getPageNav().catch(() => undefined)
-      if (nextPageNav?.page !== undefined && nextPageNav.page !== pageNumber) {
+      // Same retry as the walk itself: reading the footer straight after the
+      // modal closes can catch it mid-render, and a blank read here used to be
+      // taken as "we arrived".
+      const nextPageNav = await readPageNav()
+      if (nextPageNav?.page !== pageNumber) {
         console.warn(
-          `Go to page ${pageNumber} failed; still on page ${nextPageNav.page}; walking with chevrons...`
+          `Go to page ${pageNumber} failed; footer reports ${JSON.stringify(nextPageNav)}; walking with chevrons...`
         )
         await dismissGoToModal()
         await walkToPage(pageNumber)
@@ -673,19 +709,57 @@ export async function extractBook(
       await delay(300)
     }
 
+    /**
+     * Read the footer nav, tolerating the moment after a page turn or a modal
+     * close where it hasn't re-rendered yet. A single blank read used to be
+     * fatal.
+     */
+    async function readPageNav(): Promise<PageNav | undefined> {
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const pageNav = await getPageNav().catch(() => undefined)
+        if (pageNav) return pageNav
+
+        await delay(200)
+      }
+    }
+
     async function walkToPage(pageNumber: number) {
       for (let attempts = 0; attempts < 500; attempts++) {
-        const pageNav = await getPageNav()
-        if (!pageNav?.page) {
+        const pageNav = await readPageNav()
+        if (!pageNav) {
+          const footerText = await page
+            .locator('ion-footer ion-title')
+            .first()
+            .textContent()
+            .catch(() => undefined)
+
           throw new Error(
-            `Unable to read current page while walking to ${pageNumber}`
+            `Unable to read current page while walking to ${pageNumber} ` +
+              `(footer reads: ${JSON.stringify(footerText)})`
           )
         }
 
-        if (pageNav.page === pageNumber) return
-        if (pageNumber === 1 && pageNav.page <= 1) return
+        // The footer reports a location rather than a page in front and back
+        // matter, and for roman-numbered pages. Derive a page from it where the
+        // location map allows, so walking can still tell which way to go.
+        const currentPage =
+          pageNav.page ??
+          (pageNav.location === undefined
+            ? undefined
+            : getPageForPosition(pageNav.location))
 
-        const direction = pageNav.page > pageNumber ? 'left' : 'right'
+        if (currentPage === pageNumber) return
+        if (pageNumber === 1 && currentPage !== undefined && currentPage <= 1) {
+          return
+        }
+
+        // With no page to compare against, assume we're ahead of the content
+        // and walk forward — goToPage is only ever aimed at the start of the
+        // book or back at where the reader began.
+        const direction =
+          currentPage !== undefined && currentPage > pageNumber
+            ? 'left'
+            : 'right'
         const chevronSelector =
           direction === 'left'
             ? '.kr-chevron-container-left'
@@ -760,11 +834,46 @@ export async function extractBook(
       })
     }
 
-    async function dismissPossibleAlert() {
-      const $alertNo = page.locator('ion-alert button', { hasText: 'No' })
-      if (await $alertNo.isVisible()) {
-        await $alertNo.click()
+    /**
+     * Answer the "Most Recent Page Read" dialog.
+     *
+     * Kindle offers to jump to wherever you last read; we always want to start
+     * from the beginning, so the answer is No. It appears once the book content
+     * loads — not when the page first opens — and until it's gone every click
+     * lands on its overlay, so this has to run after the reader is ready and
+     * again before anything that navigates.
+     */
+    async function dismissPossibleAlert(): Promise<boolean> {
+      const syncDialog = page
+        .locator('ion-alert, [role="dialog"], .alert-wrapper')
+        .filter({ hasText: /most recent page read/i })
+        .first()
+
+      if (await syncDialog.isVisible().catch(() => false)) {
+        const $no = syncDialog
+          .locator('button, ion-button')
+          .filter({ hasText: /^\s*no\s*$/i })
+          .first()
+
+        if (await $no.isVisible().catch(() => false)) {
+          warnInfo('dismissing "Most Recent Page Read" dialog')
+          await $no.click({ force: true }).catch(() => {})
+          await delay(300)
+          return true
+        }
       }
+
+      // Any other yes/no alert sitting in the way.
+      const $alertNo = page
+        .locator('ion-alert button', { hasText: 'No' })
+        .first()
+      if (await $alertNo.isVisible().catch(() => false)) {
+        await $alertNo.click({ force: true }).catch(() => {})
+        await delay(300)
+        return true
+      }
+
+      return false
     }
 
     async function dismissReaderPopoverMenu() {
@@ -838,10 +947,10 @@ export async function extractBook(
       return resultPage
     }
 
-    await dismissPossibleAlert()
-    await ensureFixedHeaderUI()
-    await updateSettings()
-
+    // Wait for the book to render before touching the reader UI. The settings
+    // panel used to be driven while the content was still loading, so the sync
+    // dialog would appear mid-click and Playwright would retry against its
+    // overlay until the action timed out.
     logInfo('Waiting for book reader to load...')
     await page
       .waitForSelector(krRendererMainImageSelector, { timeout: 60_000 })
@@ -850,6 +959,10 @@ export async function extractBook(
           'Main reader content may not have loaded, continuing anyway...'
         )
       })
+
+    await dismissPossibleAlert()
+    await ensureFixedHeaderUI()
+    await updateSettings()
 
     // Record the initial page navigation so we can reset back to it later
     const initialPageNav = await getPageNav()
@@ -902,6 +1015,18 @@ export async function extractBook(
     assert(result.nav.totalNumContentPages > 0, 'No content pages found')
     const pageNumberPaddingAmount = `${result.nav.totalNumContentPages * 2}`
       .length
+
+    // Recorded before the first page is captured and mutated in place, so the
+    // metadata written after every page says "incomplete" until the loop
+    // reaches an actual end. A run killed halfway through then reads as what it
+    // is, rather than as a short book.
+    const capture: CaptureStatus = {
+      complete: false,
+      reason: 'interrupted',
+      lastPage: 0,
+      totalContentPages: result.nav.totalNumContentPages
+    }
+    result.capture = capture
     await writeResultMetadata()
 
     // Navigate to the first content page of the book
@@ -922,10 +1047,14 @@ export async function extractBook(
       const footerCurrentValue = pageNav?.page ?? pageNav?.location
 
       if (!pageNav) {
+        console.warn('lost track of the page position; stopping', { index })
+        capture.reason = 'no-page-nav'
         break
       }
 
       if (currentNavPage > result.nav.totalNumContentPages) {
+        capture.complete = true
+        capture.reason = 'past-last-content-page'
         break
       }
 
@@ -996,6 +1125,7 @@ export async function extractBook(
         screenshot: screenshotPath
       }
       result.pages.push(pageChunk)
+      capture.lastPage = currentNavPage
       if (VERBOSE_LOGGING) {
         console.warn(pageChunk)
       } else if (!QUIET_LOGGING && (index === 0 || (index + 1) % 100 === 0)) {
@@ -1011,6 +1141,8 @@ export async function extractBook(
         footerCurrentValue >= pageNav.total
       ) {
         warnInfo('reached end of book based on footer nav', pageNav)
+        capture.complete = true
+        capture.reason = 'end-of-book'
         done = true
         break
       }
@@ -1062,7 +1194,31 @@ export async function extractBook(
         }
 
         if (++retries >= 5) {
-          console.warn('unable to navigate to next page; breaking...', pageNav)
+          // Kindle removes the right-hand chevron when there is no next page.
+          // Checked only after every retry has failed, so a chevron that's
+          // briefly missing mid-render can't be mistaken for the end of the
+          // book — declaring the end early would truncate it silently, which
+          // is the failure this whole marker exists to catch.
+          const hasNextPageChevron = await page
+            .locator('.kr-chevron-container-right')
+            .count()
+            .catch(() => 1)
+
+          if (hasNextPageChevron) {
+            console.warn(
+              'unable to navigate to next page; breaking...',
+              pageNav
+            )
+            capture.reason = 'navigation-failed'
+          } else {
+            warnInfo(
+              'no next-page chevron; reached the end of the book',
+              pageNav
+            )
+            capture.complete = true
+            capture.reason = 'end-of-book'
+          }
+
           done = true
           break
         }
@@ -1070,6 +1226,11 @@ export async function extractBook(
     } while (!done)
 
     await writeResultMetadata()
+    if (!capture.complete) {
+      console.warn(
+        `capture stopped early at page ${capture.lastPage} of ${capture.totalContentPages} (${capture.reason})`
+      )
+    }
     logInfo()
     logInfo(metadataPath)
 
@@ -1113,5 +1274,3 @@ export async function runExtraction({
     await context.browser()?.close()
   }
 }
-
-// Only run main() when this file is the direct entry point (not when imported)

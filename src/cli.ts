@@ -5,10 +5,11 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { checkbox } from '@inquirer/prompts'
+import { checkbox, input } from '@inquirer/prompts'
 
 import type { BookMetadata, ContentChunk } from './types'
 import { exportBookMarkdown } from './export-book-markdown'
+import { exportBookPdf } from './export-book-pdf'
 import { launchBrowserContext, runExtraction } from './extract-kindle-book'
 import { fetchLibrary, type LibraryBook } from './kindle-library'
 import { transcribeBook } from './transcribe-book-content'
@@ -28,6 +29,7 @@ Usage
   kindle-export export <ASIN...>       render markdown from transcribed text only
 
 Options
+  --format <md|pdf>      output format(s), comma separated (default: md)
   --json                 with 'list', print JSON instead of a table
   --limit <n>            with 'list', stop after this many books
   --out-dir <dir>        where books are written (default: ./out)
@@ -43,9 +45,10 @@ Options
   -h, --help             show this help
   -v, --version          show the version
 
-Credentials come from AMAZON_EMAIL, AMAZON_PASSWORD and OPENAI_API_KEY, read
-from the environment or a .env file. Run 'kindle-export login' first — the
-session is stored on this machine and never leaves it.
+Run 'kindle-export login' first and sign in in the browser window; the session
+is stored on this machine and never leaves it. OPENAI_API_KEY is required for
+transcription. AMAZON_EMAIL and AMAZON_PASSWORD are optional — set them only
+if you want sign-in scripted rather than doing it yourself.
 
 Examples
   kindle-export login
@@ -65,12 +68,16 @@ interface Options {
   otp?: string
   json: boolean
   limit?: number
+  formats: Array<'md' | 'pdf'>
   forceCapture: boolean
   forceOcr: boolean
   forceExport: boolean
 }
 
 const COMMANDS = new Set(['login', 'list', 'capture', 'ocr', 'export'])
+
+/** Above this many books, offer to filter before showing the picker. */
+const FILTER_PROMPT_THRESHOLD = 30
 
 function defaultProfileDir(): string {
   return path.join(os.homedir(), '.kindle-export', 'profile')
@@ -85,6 +92,7 @@ function parseArgs(argv: string[]): Options | undefined {
   let otp: string | undefined
   let json = false
   let limit: number | undefined
+  let formats: Array<'md' | 'pdf'> = ['md']
   let force = false
   let forceCapture = false
   let forceOcr = false
@@ -128,6 +136,20 @@ function parseArgs(argv: string[]): Options | undefined {
       case '--limit':
         limit = Number.parseInt(next(), 10)
         break
+      case '--format': {
+        const requested = next()
+          .split(',')
+          .map((value) => value.trim().toLowerCase())
+        for (const value of requested) {
+          assert(
+            value === 'md' || value === 'pdf',
+            `unknown format: ${value} (expected md or pdf)`
+          )
+        }
+
+        formats = requested as Array<'md' | 'pdf'>
+        break
+      }
       case '--force':
         force = true
         break
@@ -162,6 +184,7 @@ function parseArgs(argv: string[]): Options | undefined {
     otp,
     json,
     limit,
+    formats,
     forceCapture: force || forceCapture,
     forceOcr: force || forceOcr,
     forceExport: force || forceExport
@@ -271,10 +294,34 @@ async function selectFromLibrary(options: Options): Promise<string[]> {
     return []
   }
 
+  // A flat checkbox of a few hundred books is unusable, so offer to narrow it
+  // down first. Empty input keeps everything.
+  let shortlist = books
+  if (books.length > FILTER_PROMPT_THRESHOLD) {
+    const needle = (
+      await input({
+        message: `${books.length} books. Filter by title or author (blank for all):`
+      })
+    )
+      .trim()
+      .toLowerCase()
+
+    if (needle) {
+      shortlist = books.filter((book) =>
+        `${book.title} ${book.authors.join(' ')}`.toLowerCase().includes(needle)
+      )
+
+      if (!shortlist.length) {
+        console.log(`Nothing matched "${needle}".`)
+        return []
+      }
+    }
+  }
+
   return checkbox({
-    message: `Select books to export (${books.length} in your library)`,
+    message: `Select books to export (${shortlist.length} shown)`,
     pageSize: 15,
-    choices: books.map((book) => ({
+    choices: shortlist.map((book) => ({
       name: `${formatBookLine(book)}  [${book.asin}]`,
       value: book.asin
     }))
@@ -290,19 +337,13 @@ async function capture(asin: string, options: Options): Promise<BookMetadata> {
     return existing
   }
 
-  const amazonEmail = getEnv('AMAZON_EMAIL')
-  const amazonPassword = getEnv('AMAZON_PASSWORD')
-  assert(amazonEmail, 'AMAZON_EMAIL is required (set it in your environment)')
-  assert(
-    amazonPassword,
-    'AMAZON_PASSWORD is required (set it in your environment)'
-  )
-
   console.log(`[${asin}] capture: opening Kindle reader`)
+  // Credentials are optional: the stored session usually covers it, and if it
+  // doesn't, you sign in by hand in the browser window that opens.
   await runExtraction({
     asin,
-    amazonEmail,
-    amazonPassword,
+    amazonEmail: getEnv('AMAZON_EMAIL'),
+    amazonPassword: getEnv('AMAZON_PASSWORD'),
     outDir: options.outDir,
     profileDir: options.profileDir,
     otp: options.otp
@@ -385,12 +426,22 @@ async function processBook(asin: string, options: Options): Promise<string> {
     return path.join(options.outDir, asin, 'content.json')
   }
 
-  const markdown = await exportBookMarkdown({ asin, outDir: options.outDir })
+  const written: string[] = []
+  for (const format of options.formats) {
+    written.push(
+      format === 'pdf'
+        ? await exportBookPdf({ asin, outDir: options.outDir })
+        : await exportBookMarkdown({ asin, outDir: options.outDir })
+    )
+  }
+
   console.log(
-    `[${asin}] done in ${formatDuration(Date.now() - startedAt)}: ${path.resolve(markdown)}`
+    `[${asin}] done in ${formatDuration(Date.now() - startedAt)}: ${written
+      .map((file) => path.resolve(file))
+      .join(', ')}`
   )
 
-  return markdown
+  return written[0]!
 }
 
 async function main() {

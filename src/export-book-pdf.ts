@@ -9,13 +9,24 @@ import PDFDocument from 'pdfkit'
 import type { BookMetadata, ContentChunk } from './types'
 import { formatContentChunks } from './postprocess-text'
 import { resolveBookSections } from './toc-sections'
-import { assert, getEnv } from './utils'
+import { assert } from './utils'
 
-async function main() {
-  const asin = getEnv('ASIN')
-  assert(asin, 'ASIN is required')
+export interface ExportBookPdfOptions {
+  asin: string
+  /** Root directory holding one folder per ASIN. Defaults to `out`. */
+  outDir?: string
+}
 
-  const outDir = path.join('out', asin)
+/**
+ * Render an already-transcribed book to PDF.
+ *
+ * Returns the path written.
+ */
+export async function exportBookPdf({
+  asin,
+  outDir: root = 'out'
+}: ExportBookPdfOptions): Promise<string> {
+  const outDir = path.join(root, asin)
 
   const content = JSON.parse(
     await fsp.readFile(path.join(outDir, 'content.json'), 'utf8')
@@ -38,7 +49,8 @@ async function main() {
       Author: authors.join(', ')
     }
   })
-  const stream = doc.pipe(fs.createWriteStream(path.join(outDir, 'book.pdf')))
+  const outputPath = path.join(outDir, 'book.pdf')
+  const stream = doc.pipe(fs.createWriteStream(outputPath))
 
   const fontSize = 12
 
@@ -103,6 +115,6 @@ async function main() {
     stream.on('finish', resolve)
     stream.on('error', reject)
   })
-}
 
-await main()
+  return outputPath
+}

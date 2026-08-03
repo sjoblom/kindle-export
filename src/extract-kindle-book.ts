@@ -25,7 +25,6 @@ import {
   extractTar,
   getEnv,
   hashObject,
-  isDirectEntry,
   normalizeAuthors,
   normalizeBookMetadata,
   parseJsonpResponse,
@@ -245,13 +244,21 @@ export async function launchBrowserContext(
 
 export interface ExtractBookOptions {
   asin: string
-  amazonEmail: string
-  amazonPassword: string
+  /**
+   * Amazon credentials, used only if the stored session has expired. Leave
+   * them unset to sign in by hand in the browser window instead — no need to
+   * keep an Amazon password in a plaintext file.
+   */
+  amazonEmail?: string
+  amazonPassword?: string
   /** Root directory holding one folder per ASIN. Defaults to `out`. */
   outDir?: string
   /** 2FA code, when the caller has one and no TTY is available to prompt on. */
   otp?: string
 }
+
+/** How long to wait for a person to complete sign-in by hand. */
+const MANUAL_SIGN_IN_TIMEOUT_MS = 5 * 60 * 1000
 
 /**
  * Extract a single Kindle book using the given browser context.
@@ -485,31 +492,50 @@ export async function extractBook(
 
     // If we're on the signin page, start the authentication flow.
     if (/\/ap\/signin/g.test(new URL(page.url()).pathname)) {
-      await page.locator('input[type="email"]').fill(amazonEmail)
-      await page.locator('input[type="submit"]').click()
+      if (!amazonEmail || !amazonPassword) {
+        // No stored credentials, so let the person sign in themselves in the
+        // browser window that's already open. This is the default path: it
+        // keeps Amazon passwords out of config files entirely, and handles
+        // whatever challenge Amazon throws up without us having to script it.
+        logInfo(
+          'Amazon needs you to sign in. Complete sign-in in the browser window...'
+        )
 
-      await page.locator('input[type="password"]').fill(amazonPassword)
-      // await page.locator('input[type="checkbox"]').click()
-      await page.locator('input[type="submit"]').click()
+        await page.waitForURL(
+          (url) => !/\/ap\/signin/.test(new URL(url).pathname),
+          { timeout: MANUAL_SIGN_IN_TIMEOUT_MS }
+        )
 
-      if (!/\/kindle-library/g.test(new URL(page.url()).pathname)) {
-        const envOtpCode = otp?.trim() || getEnv('AMAZON_OTP')?.trim()
-        const code =
-          envOtpCode ||
-          (process.stdin.isTTY
-            ? await input({
-                message: '2-factor auth code?'
-              })
-            : '')
+        logInfo('Signed in.')
+      } else {
+        await page.locator('input[type="email"]').fill(amazonEmail)
+        await page.locator('input[type="submit"]').click()
 
-        // Only enter 2-factor auth code if needed
-        if (code) {
-          await page.locator('input[type="tel"]').fill(code)
-          await page
-            .locator(
-              'input[type="submit"][aria-labelledby="cvf-submit-otp-button-announce"]'
-            )
-            .click()
+        await page.locator('input[type="password"]').fill(amazonPassword)
+        // await page.locator('input[type="checkbox"]').click()
+        await page.locator('input[type="submit"]').click()
+
+        // Only relevant to the scripted path — when signing in by hand, 2FA is
+        // dealt with in the browser rather than at the terminal.
+        if (!/\/kindle-library/g.test(new URL(page.url()).pathname)) {
+          const envOtpCode = otp?.trim() || getEnv('AMAZON_OTP')?.trim()
+          const code =
+            envOtpCode ||
+            (process.stdin.isTTY
+              ? await input({
+                  message: '2-factor auth code?'
+                })
+              : '')
+
+          // Only enter 2-factor auth code if needed
+          if (code) {
+            await page.locator('input[type="tel"]').fill(code)
+            await page
+              .locator(
+                'input[type="submit"][aria-labelledby="cvf-submit-otp-button-announce"]'
+              )
+              .click()
+          }
         }
       }
 
@@ -1063,18 +1089,4 @@ export async function runExtraction({
   }
 }
 
-async function cli() {
-  const asin = getEnv('ASIN')
-  const amazonEmail = getEnv('AMAZON_EMAIL')
-  const amazonPassword = getEnv('AMAZON_PASSWORD')
-  assert(asin, 'ASIN is required')
-  assert(amazonEmail, 'AMAZON_EMAIL is required')
-  assert(amazonPassword, 'AMAZON_PASSWORD is required')
-
-  await runExtraction({ asin, amazonEmail, amazonPassword })
-}
-
 // Only run main() when this file is the direct entry point (not when imported)
-if (isDirectEntry(import.meta.url)) {
-  await cli()
-}

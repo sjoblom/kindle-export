@@ -6,13 +6,7 @@ import path from 'node:path'
 import type { BookMetadata, ContentChunk, IllustrationChunk } from './types'
 import { formatContentChunks } from './postprocess-text'
 import { resolveBookSections } from './toc-sections'
-import {
-  assert,
-  getEnv,
-  isDirectEntry,
-  readJsonFile,
-  tryReadJsonFile
-} from './utils'
+import { assert, readJsonFile, tryReadJsonFile } from './utils'
 
 const MAX_MARKDOWN_FILENAME_STEM_LENGTH = 80
 
@@ -215,16 +209,4 @@ ${text}`
   await fs.writeFile(outputPath, output)
 
   return outputPath
-}
-
-async function cli() {
-  const asin = getEnv('ASIN')
-  assert(asin, 'ASIN is required')
-
-  const outputPath = await exportBookMarkdown({ asin })
-  console.log(path.resolve(outputPath))
-}
-
-if (isDirectEntry(import.meta.url)) {
-  await cli()
 }

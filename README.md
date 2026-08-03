@@ -28,17 +28,21 @@ picks up where it left off. Use `--force-ocr` (or `--force`) to redo a stage.
 
 ## Install
 
-Requires Node 20+, Chrome, and an OpenAI API key.
+Requires Node 20+, Google Chrome, and an OpenAI API key.
 
 ```bash
+git clone https://github.com/sjoblom/kindle-export
+cd kindle-export
 pnpm install
+pnpm build
+npm link          # optional: puts `kindle-export` on your PATH
 ```
 
-Set credentials in `.env` (see `.env.example`):
+Without `npm link`, run it as `pnpm kindle-export <args>`.
+
+The only required setting is your OpenAI key, in `.env` (see `.env.example`):
 
 ```
-AMAZON_EMAIL=
-AMAZON_PASSWORD=
 OPENAI_API_KEY=
 ```
 
@@ -48,6 +52,28 @@ yourself, and stores the session under `~/.kindle-export/profile`:
 ```bash
 kindle-export login
 ```
+
+**You do not need to put your Amazon password anywhere.** If the stored session
+expires, a browser window opens and you sign in by hand. `AMAZON_EMAIL` and
+`AMAZON_PASSWORD` exist only if you want sign-in scripted for unattended runs.
+
+### What leaves your machine
+
+Every page image is sent to OpenAI to be transcribed — that is the one and only
+network call this tool makes on your behalf, and it is unavoidable, because
+Kindle renders pages as images with no text layer to read.
+
+Nothing else leaves your machine. Your Amazon session stays in a local browser
+profile; the book text and images stay in `out/`.
+
+Cost is roughly one vision-model call per page. A 300-page book runs to a few
+tens of cents on `gpt-4.1-mini`, and both the model and the concurrency are
+configurable.
+
+### Platform support
+
+Developed and tested on **macOS only**. It should work anywhere Node and Chrome
+do, but Linux and Windows are genuinely untested — reports welcome.
 
 ## Usage
 
@@ -61,9 +87,9 @@ kindle-export ocr <ASIN...>          transcribe captured pages only
 kindle-export export <ASIN...>       render markdown from transcribed text only
 ```
 
-Useful options: `--json` and `--limit` for `list`, plus `--out-dir`,
-`--profile-dir`, `--model`, `--concurrency`, `--otp` and `--force`. Run
-`kindle-export --help` for the full list.
+Useful options: `--format md,pdf`, `--json` and `--limit` for `list`, plus
+`--out-dir`, `--profile-dir`, `--model`, `--concurrency`, `--otp` and
+`--force`. Run `kindle-export --help` for the full list.
 
 `list` reads the same internal JSON endpoint the Kindle library page uses, so
 it sees everything in your account and pages through it. Piping `--json`
@@ -117,12 +143,18 @@ captured pages, so the label match is what actually pins a chapter down.
 
 This is for exporting books **you have purchased**, for your own reading,
 research and archival use. Automating Kindle Cloud Reader is contrary to
-Amazon's terms of service, and using it may put your Amazon account at risk.
-Don't redistribute what it produces — the output is copyrighted material.
+Amazon's terms of service, and using it may put your Amazon account at risk —
+that risk is yours to weigh. Don't redistribute what it produces; the output is
+copyrighted material belonging to its authors and publishers.
+
+Not affiliated with, endorsed by, or connected to Amazon. "Kindle" is a
+trademark of Amazon.com, Inc.
 
 ## Credits
 
 A fork of [kindle-ai-export](https://github.com/transitive-bullshit/kindle-ai-export)
-by Travis Fischer, MIT licensed. This fork adds a unified CLI, resumable
-stages, deterministic text post-processing, and table-of-contents section
-resolution.
+by Travis Fischer, MIT licensed. This fork adds a unified CLI, library listing
+and selection, resumable stages, deterministic text post-processing, and
+table-of-contents section resolution.
+
+Licensed under the [MIT License](LICENSE).

@@ -7,7 +7,7 @@ import { OpenAIClient } from 'openai-fetch'
 import pMap from 'p-map'
 
 import type { BookMetadata, ContentChunk, TocItem } from './types'
-import { assert, getEnv, isDirectEntry, readJsonFile } from './utils'
+import { assert, getEnv, readJsonFile } from './utils'
 
 const DEFAULT_OCR_MODEL = 'gpt-4.1-mini'
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
@@ -244,24 +244,4 @@ Do not include any additional text, descriptions, or punctuation. Ignore any emb
   )
 
   return content
-}
-
-async function cli() {
-  const asin = getEnv('ASIN')
-  assert(asin, 'ASIN is required')
-
-  const timeout = getEnv('OCR_REQUEST_TIMEOUT_MS')
-  const content = await transcribeBook({
-    asin,
-    model: getEnv('OCR_MODEL') || undefined,
-    requestTimeoutMs: timeout ? Number.parseInt(timeout, 10) : undefined
-  })
-
-  console.log(
-    `Wrote ${content.length} OCR chunks to ${path.join('out', asin, 'content.json')}`
-  )
-}
-
-if (isDirectEntry(import.meta.url)) {
-  await cli()
 }

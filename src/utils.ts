@@ -1,8 +1,6 @@
 import fs from 'node:fs/promises'
-import path from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { fileURLToPath } from 'node:url'
 
 import hashObjectImpl from 'hash-object'
 import timeFormat from 'hh-mm-ss'
@@ -11,19 +9,6 @@ import { extract } from 'tar'
 import { temporaryDirectory } from 'tempy'
 
 import type { BookMetadata } from './types'
-
-/**
- * Whether this module is the process entry point rather than an import.
- *
- * Each stage doubles as a standalone script and as a library function the CLI
- * calls in-process, so the script half must not run when the CLI imports it.
- */
-export function isDirectEntry(importMetaUrl: string): boolean {
-  const entry = process.argv[1]
-  if (!entry) return false
-
-  return path.resolve(fileURLToPath(importMetaUrl)) === path.resolve(entry)
-}
 
 export function assert(
   value: unknown,

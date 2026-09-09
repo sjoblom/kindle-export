@@ -17,7 +17,7 @@ const CHROME =
 
 /** Chrome's SingletonLock target: `<host>-<pid>`. */
 function lockTarget(pid: number): string {
-  return `Emils-MacBook-Pro.local-${pid}`
+  return `Someones-MacBook-Pro.local-${pid}`
 }
 
 function inspect(
@@ -86,7 +86,7 @@ describe('commandLineOwnsProfile', () => {
     // `ps -o command=` joins the arguments with spaces and adds no quotes, so
     // the path runs straight into the flags after it. Cutting it at the first
     // space called a live browser stale and deleted its lock.
-    const spaced = '/Users/emil/Library/Kindle Export/profile'
+    const spaced = '/Users/reader/Library/Kindle Export/profile'
     expect(
       commandLineOwnsProfile(
         `chrome --user-data-dir=${spaced} --hide-crash-restore-bubble`,

@@ -188,6 +188,27 @@ describe('serve', () => {
     expect(await res.text()).toBe('hello book')
   })
 
+  it('downloads a file whose name is not Latin-1', async () => {
+    // Someone renames an export by hand and it still has to come down. The raw
+    // name in a header is what Node refuses outright, so the plain `filename`
+    // has to be an ASCII stand-in with the real name only in `filename*`.
+    const name = '日本語.md'
+    await fs.writeFile(path.join(outDir, 'B00TEST', name), 'hello book')
+
+    const res = await fetch(
+      handle.url + '/api/download/B00TEST/' + encodeURIComponent(name)
+    )
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe('hello book')
+
+    const disposition = res.headers.get('content-disposition') ?? ''
+    expect(disposition).toBe(
+      `attachment; filename="book.md"; filename*=UTF-8''${encodeURIComponent(name)}`
+    )
+    // Latin-1 only, or Node would never have written it in the first place.
+    expect(disposition).toMatch(/^[\u0020-\u007E]+$/)
+  })
+
   it('refuses download paths that leave the book folder', async () => {
     const traversal = await fetch(
       handle.url + '/api/download/B00TEST/..%2Fsecret.md'

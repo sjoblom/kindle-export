@@ -746,14 +746,60 @@ class App {
       throw new HttpError(404, 'file not found')
     })
 
-    res.writeHead(200, {
+    const headers: http.OutgoingHttpHeaders = {
       'content-type': name.endsWith('.pdf')
         ? 'application/pdf'
         : 'text/markdown; charset=utf-8',
       'content-length': stat.size,
-      'content-disposition': `attachment; filename="${name.replaceAll('"', '')}"; filename*=UTF-8''${encodeURIComponent(name)}`,
+      'content-disposition': contentDisposition(name),
       'cache-control': 'no-store'
-    })
+    }
+
+    // Node validates header values here, not when the object is built. A
+    // refusal must surface as an ordinary error response: the file's
+    // content-length has not been promised yet, so the body isn't truncated.
+    try {
+      res.writeHead(200, headers)
+    } catch (err) {
+      throw new HttpError(
+        500,
+        `invalid download headers: ${(err as Error).message}`
+      )
+    }
     createReadStream(filePath).pipe(res)
   }
+}
+
+/**
+ * A `Content-Disposition` a browser and Node both accept.
+ *
+ * Node rejects header values holding anything outside Latin-1, and an export
+ * can be renamed to anything at all — so the plain `filename` parameter carries
+ * an ASCII-only stand-in and the real name travels percent-encoded in
+ * `filename*`, which every current browser prefers anyway.
+ */
+function contentDisposition(name: string): string {
+  return `attachment; filename="${asciiFallbackName(name)}"; filename*=UTF-8''${encodeRfc5987(name)}`
+}
+
+/** `name` reduced to printable ASCII, never empty, keeping its extension. */
+function asciiFallbackName(name: string): string {
+  const ext = name.toLowerCase().endsWith('.pdf') ? '.pdf' : '.md'
+  const stem = name
+    .slice(0, Math.max(0, name.length - ext.length))
+    // Control characters, quotes and separators would all break the quoted
+    // string; a name of nothing but those leaves the generic fallback.
+    .replaceAll(/[^\u0020-\u007E]/g, '')
+    .replaceAll(/["\\;]/g, '')
+    .trim()
+
+  return `${stem || 'book'}${ext}`
+}
+
+/** Percent-encoding for the `filename*` ext-value of RFC 5987. */
+function encodeRfc5987(name: string): string {
+  return encodeURIComponent(name).replaceAll(
+    /['()*!]/g,
+    (c) => `%${c.codePointAt(0)!.toString(16).toUpperCase()}`
+  )
 }

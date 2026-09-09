@@ -28,3 +28,37 @@ jobs:
       - run: pnpm test
 
       - run: pnpm build
+
+  # The Vision OCR tests and the app bundle only exist on macOS, and both are
+  # the parts a Linux-only CI cannot say anything about.
+  macos:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+          PATCHRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+
+      # The vision tests skip themselves unless bin/kindle-ocr-macos exists, so
+      # build the worker first or this job would quietly test nothing extra.
+      - run: pnpm build:ocr
+
+      - run: test -x bin/kindle-ocr-macos
+
+      - run: pnpm test
+
+      - run: pnpm build
+
+      # Packaging stages dependencies from the lockfile for the target CPU and
+      # smoke-tests the result with the bundled Node before it finishes.
+      - run: pnpm package

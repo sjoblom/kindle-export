@@ -68,7 +68,7 @@ If something goes wrong at startup it says so and points at
 ## How it works
 
 Kindle Cloud Reader renders each page as an image, so there is no text layer to
-read. The pipeline is three stages, and each one resumes:
+read. The pipeline is three stages:
 
 1. **capture** — drives a real browser through the book, saving one image per
    rendered page plus the table of contents and metadata.
@@ -77,13 +77,18 @@ read. The pipeline is three stages, and each one resumes:
    elsewhere, or with `--model`, an OpenAI vision model.
 3. **export** — reassembles the text into markdown.
 
-Re-running skips any stage whose output already exists, so an interrupted book
-picks up where it left off. Use `--force-ocr` (or `--force`) to redo a stage.
+Re-running skips any stage whose output already exists, but how much of a
+half-finished book survives depends on the stage. A capture that was
+interrupted cannot be continued: it is reported as incomplete, and the book has
+to be captured again from the beginning. Transcription resumes at page
+granularity — if some pages fail, re-running retries only those, rather than
+paying to read the whole book again. Export is regenerated from `content.json`
+whenever it is asked for, so it costs nothing to redo. Use `--force-ocr` (or
+`--force`) to redo a stage deliberately.
 
-Transcription resumes at page granularity: if some pages fail, re-running
-retries only those, rather than paying to read the whole book again. Pages that
-could never be read are listed explicitly and the command exits non-zero — an
-export with holes in it isn't success, even though a file was written.
+Pages that could never be read are listed explicitly and the command exits
+non-zero — an export with holes in it isn't success, even though a file was
+written.
 
 ## Install
 
@@ -179,7 +184,7 @@ The ASIN is also in the Amazon URL for a book — `.../dp/B01H4G2J1U`.
 out/<ASIN>/
   metadata.json    title, authors, table of contents, page index
   pages/           one PNG per rendered page
-  content.json     transcribed text, one chunk per page
+  content.json     transcribed text, one chunk per page, tagged with the capture it came from
   <title>.md       the finished markdown
 ```
 

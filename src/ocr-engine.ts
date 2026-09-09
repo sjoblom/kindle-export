@@ -20,7 +20,14 @@ export interface OcrEngine {
   readonly name: string
   /** Whether pages cost money to read, so callers can warn before a long run. */
   readonly costsMoney: boolean
-  /** Read one page. Throwing asks the caller to retry. */
+  /**
+   * Read one page. Throwing asks the caller to retry.
+   *
+   * One newline in the returned text means one paragraph boundary — never a
+   * wrapped line — because that is the only structure the formatter has to work
+   * from. An engine that sees the page as rendered lines has to put the
+   * paragraphs back together itself (see `ocr-layout.ts`).
+   */
   recognize(request: OcrRequest): Promise<string>
   /** Release any worker process. Safe to call more than once. */
   close(): Promise<void>

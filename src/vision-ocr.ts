@@ -4,6 +4,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import type { OcrEngine, OcrRequest } from './ocr-engine'
+import { parseOcrLines, reconstructParagraphs } from './ocr-layout'
 
 /**
  * Local OCR on macOS via Apple's Vision framework, so the normal path needs no
@@ -12,10 +13,15 @@ import type { OcrEngine, OcrRequest } from './ocr-engine'
  * The binary is a long-lived worker rather than one process per page: startup
  * dominates a single page's cost, so spawning per page would add roughly a
  * second each to a book of hundreds.
+ *
+ * Vision recognises one rendered line at a time, so the worker answers with a
+ * box per line and the paragraphs are rebuilt here — the formatter downstream
+ * reads every newline as a paragraph break, and one line per newline would make
+ * every wrapped line its own paragraph.
  */
 
 /** Bumped alongside the binary's own `protocol` field when the wire format changes. */
-const SUPPORTED_PROTOCOL = 1
+const SUPPORTED_PROTOCOL = 2
 const HANDSHAKE_TIMEOUT_MS = 10_000
 
 interface PendingRequest {
@@ -47,6 +53,18 @@ export async function isVisionOcrAvailable(): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+/**
+ * The page's text as paragraphs. `text` is the older protocol's shape and is
+ * only here so a stale binary degrades to over-split prose rather than to
+ * nothing at all.
+ */
+function pageText(message: any): string {
+  const lines = parseOcrLines(message?.lines)
+  if (lines.length) return reconstructParagraphs(lines)
+
+  return typeof message?.text === 'string' ? message.text : ''
 }
 
 export function createVisionOcrEngine(
@@ -86,7 +104,7 @@ export function createVisionOcrEngine(
 
     pending.delete(message.id)
     if (message.ok) {
-      request.resolve(typeof message.text === 'string' ? message.text : '')
+      request.resolve(pageText(message))
     } else {
       request.reject(new Error(message?.error ?? 'Vision OCR failed'))
     }

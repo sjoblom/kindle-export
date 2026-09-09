@@ -10,13 +10,19 @@ import Vision
 // id, so they may come back in any order.
 //
 //   ->  {"id":1,"path":"/…/001-001.png"}
-//   <-  {"id":1,"ok":true,"text":"…"}
+//   <-  {"id":1,"ok":true,"lines":[{"text":"…","left":0,"top":0,"width":0,"height":0}]}
 //   <-  {"id":2,"ok":false,"error":"unreadable image"}
 //
-// Startup emits {"ready":true,"protocol":1} so the caller can tell a working
+// Answers are one entry per *rendered* line, with the box it occupies, rather
+// than a blob of text: where the lines sit is the only remaining evidence of
+// where the paragraphs were, and the caller rebuilds them from it (see
+// src/ocr-layout.ts). Doing that here would work too, but in TypeScript it can
+// be unit-tested against fixtures without running Vision at all.
+//
+// Startup emits {"ready":true,"protocol":2} so the caller can tell a working
 // binary from one the OS refused to run.
 
-let protocolVersion = 1
+let protocolVersion = 2
 
 struct Request: Decodable {
   let id: Int
@@ -31,10 +37,22 @@ struct Request: Decodable {
   let correct: Bool?
 }
 
+/// One recognised line, in pixels from the top-left of the page image. Vision
+/// reports normalised boxes with the origin at the bottom left; flipping them
+/// here means only one place has to know that, and the caller reasons in the
+/// same frame a reader would.
+struct Line: Encodable {
+  let text: String
+  let left: Double
+  let top: Double
+  let width: Double
+  let height: Double
+}
+
 struct Response: Encodable {
   let id: Int
   let ok: Bool
-  var text: String?
+  var lines: [Line]?
   var error: String?
 }
 
@@ -62,7 +80,7 @@ func writeLine(_ data: Data) {
 
 func emit(_ response: Response) {
   guard let data = try? encoder.encode(response) else {
-    // Encoding a struct of two strings should not fail, but a response that
+    // Encoding plain strings and doubles should not fail, but a response that
     // never arrives would hang the caller, so answer with something valid.
     let fallback = #"{"id":\#(response.id),"ok":false,"error":"encoding failed"}"#
     writeLine(Data(fallback.utf8))
@@ -71,7 +89,13 @@ func emit(_ response: Response) {
   writeLine(data)
 }
 
-func recognize(path: String, languages: [String]?, correct: Bool) throws -> String {
+/// Trim the noise off a normalised coordinate scaled to pixels: sub-pixel
+/// precision means nothing here and would triple the size of a page's JSON.
+func round2(_ value: Double) -> Double {
+  (value * 100).rounded() / 100
+}
+
+func recognize(path: String, languages: [String]?, correct: Bool) throws -> [Line] {
   guard let image = NSImage(contentsOfFile: path),
     let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
   else {
@@ -88,13 +112,25 @@ func recognize(path: String, languages: [String]?, correct: Bool) throws -> Stri
   let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
   try handler.perform([request])
 
-  guard let observations = request.results else { return "" }
+  guard let observations = request.results else { return [] }
 
-  // Observations arrive in reading order; one line each.
-  return
-    observations
-    .compactMap { $0.topCandidates(1).first?.string }
-    .joined(separator: "\n")
+  // Observations arrive in reading order; one line each. Keep that order — it
+  // is the reading order Vision worked out — and hand the caller each box so it
+  // can tell a wrapped line from a new paragraph.
+  let width = Double(cgImage.width)
+  let height = Double(cgImage.height)
+
+  return observations.compactMap { observation in
+    guard let text = observation.topCandidates(1).first?.string else { return nil }
+
+    let box = observation.boundingBox
+    return Line(
+      text: text,
+      left: round2(box.minX * width),
+      top: round2((1 - box.maxY) * height),
+      width: round2(box.width * width),
+      height: round2(box.height * height))
+  }
 }
 
 let queue = DispatchQueue(
@@ -133,15 +169,15 @@ while let line = readLine(strippingNewline: true) {
       group.leave()
     }
     do {
-      let text = try recognize(
+      let lines = try recognize(
         path: request.path,
         languages: request.languages,
         correct: request.correct ?? true)
-      emit(Response(id: request.id, ok: true, text: text, error: nil))
+      emit(Response(id: request.id, ok: true, lines: lines, error: nil))
     } catch {
       emit(
         Response(
-          id: request.id, ok: false, text: nil,
+          id: request.id, ok: false, lines: nil,
           error: error.localizedDescription))
     }
   }

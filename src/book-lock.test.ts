@@ -10,6 +10,7 @@ import {
   bookLockPath,
   isBookBusyError,
   ownerLooksLive,
+  takeoverPath,
   withBookLock
 } from './book-lock'
 
@@ -146,54 +147,116 @@ describe('withBookLock', () => {
     await expect(withBookLock(bookDir, async () => 'ran')).resolves.toBe('ran')
   })
 
-  it('lets exactly one of many contenders take over a stale lock', async () => {
-    // Every contender reads the same stale owner before any of them acts on
-    // it — the interleaving that let two runs both "win" when takeover was a
-    // plain overwrite. The rename that moves the stale file aside can only
-    // succeed once, so one contender links its lock and the rest find it live.
+  it("does not let a paused contender rename away a fresh owner's lock", async () => {
+    // The sequence that beat the previous version: A and B both look at the
+    // same stale owner; B pauses inside its liveness check; A takes over and
+    // enters; B resumes with its stale verdict and renames A's fresh lock
+    // aside. Inspection now happens under the takeover directory, so B still
+    // holds that directory while paused and A cannot have acted in between —
+    // A instead waits its turn and finds B's live lock.
     await plantLock(4242)
 
-    const contenders = 8
-    let readOwners = 0
-    let allRead: () => void
-    const everyoneHasRead = new Promise<void>((resolve) => {
-      allRead = resolve
+    let releaseB: () => void
+    const bMayResume = new Promise<void>((resolve) => {
+      releaseB = resolve
+    })
+    let bIsInspecting: () => void
+    const bStartedInspecting = new Promise<void>((resolve) => {
+      bIsInspecting = resolve
     })
 
     let inside = 0
     let mostInside = 0
-    const outcomes = await Promise.all(
-      Array.from({ length: contenders }, () =>
-        withBookLock(
-          bookDir,
-          async () => {
-            mostInside = Math.max(mostInside, ++inside)
-            await new Promise((resolve) => setTimeout(resolve, 20))
-            inside--
-            return 'entered'
-          },
-          {
-            isAlive: () => true,
-            commandLine: async (pid) => {
-              // The planted owner is stale; the winner's own lock is live. A
-              // contender that is asked about our pid has lost the race.
-              if (pid === process.pid) return 'node vitest'
+    const enter = async () => {
+      mostInside = Math.max(mostInside, ++inside)
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      inside--
+      return 'entered'
+    }
+    const probes = (pause: boolean) => ({
+      isAlive: () => true,
+      commandLine: async (pid: number) => {
+        if (pid === process.pid) return 'node vitest'
+        if (pause) {
+          bIsInspecting()
+          await bMayResume
+        }
+        return '/usr/bin/vim'
+      }
+    })
 
-              if (++readOwners === contenders) allRead!()
-              await everyoneHasRead
-              return '/usr/bin/vim'
-            }
-          }
-        ).catch((err: unknown) => (isBookBusyError(err) ? 'busy' : err))
-      )
+    const runB = withBookLock(bookDir, enter, probes(true)).catch(
+      (err: unknown) => (isBookBusyError(err) ? 'busy' : err)
     )
+    await bStartedInspecting
+    const runA = withBookLock(bookDir, enter, probes(false)).catch(
+      (err: unknown) => (isBookBusyError(err) ? 'busy' : err)
+    )
+    // Give A every chance to act while B is paused.
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    releaseB!()
 
-    expect(outcomes.filter((o) => o === 'entered')).toHaveLength(1)
-    expect(outcomes.filter((o) => o === 'busy')).toHaveLength(contenders - 1)
+    const [a, b] = await Promise.all([runA, runB])
+    expect(b).toBe('entered')
+    expect(a).toBe('busy')
     expect(mostInside).toBe(1)
     await expect(fs.access(bookLockPath(bookDir))).rejects.toThrow()
     expect(await leftovers()).toEqual([])
   })
+
+  it('serialises many contenders over one stale lock', async () => {
+    await plantLock(4242)
+
+    let inside = 0
+    let mostInside = 0
+    const outcomes = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        takeOverStale(async () => {
+          mostInside = Math.max(mostInside, ++inside)
+          await new Promise((resolve) => setTimeout(resolve, 20))
+          inside--
+          return 'entered'
+        }).catch((err: unknown) => (isBookBusyError(err) ? 'busy' : err))
+      )
+    )
+
+    // Whether a given contender enters (after the previous one released) or
+    // is told the book is busy depends on timing; what may never happen is
+    // two of them inside at once.
+    expect(outcomes.every((o) => o === 'entered' || o === 'busy')).toBe(true)
+    expect(outcomes.filter((o) => o === 'entered').length).toBeGreaterThan(0)
+    expect(mostInside).toBe(1)
+    await expect(fs.access(bookLockPath(bookDir))).rejects.toThrow()
+    expect(await leftovers()).toEqual([])
+  })
+
+  it('clears a takeover directory left by a holder that died', async () => {
+    await fs.mkdir(takeoverPath(bookDir))
+    await fs.writeFile(path.join(takeoverPath(bookDir), 'pid'), '4242')
+    await plantLock(4242)
+
+    // The lock is stale, so the only thing standing in the way is the dead
+    // holder's takeover directory.
+    const result = await withBookLock(bookDir, async () => 'ran', {
+      isAlive: () => false
+    })
+
+    expect(result).toBe('ran')
+    expect(await leftovers()).toEqual([])
+  })
+
+  it('reports busy rather than inspecting alongside a live, slow holder', async () => {
+    await fs.mkdir(takeoverPath(bookDir))
+    await fs.writeFile(
+      path.join(takeoverPath(bookDir), 'pid'),
+      `${process.pid}`
+    )
+    await plantLock(4242)
+
+    await expect(
+      withBookLock(bookDir, async () => 'ran', { isAlive: () => true })
+    ).rejects.toSatisfy(isBookBusyError)
+  }, 10_000)
 
   it('never removes a lock a later run has taken over', async () => {
     // Run A's lock goes stale from B's point of view (B is told A's pid is
@@ -232,12 +295,11 @@ describe('withBookLock', () => {
     })
   })
 
-  it('lets only one of two real processes take over a stale lock', async () => {
-    // The same race as above, across process boundaries: two Node processes
-    // both read the stale owner, are both released at once, and both try to
-    // take the lock over. Each writes what happened to it.
+  it('keeps two real processes from both entering on one stale lock', async () => {
+    // The staggered schedule across process boundaries: worker B reads the
+    // stale owner and pauses; worker A is then started and left to do
+    // whatever it can; B is released. Each worker records when it was inside.
     await plantLock(4242)
-    const proceed = path.join(bookDir, 'proceed')
     const script = path.join(bookDir, 'contender.mts')
     await fs.writeFile(
       script,
@@ -247,59 +309,78 @@ describe('withBookLock', () => {
         path.resolve('src/book-lock.ts')
       )}
 
-      const [bookDir, proceed, out] = process.argv.slice(2)
+      const [bookDir, out, inspecting, resume] = process.argv.slice(2)
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+      const exists = (p) => fs.access(p).then(() => true, () => false)
 
       try {
         await withBookLock(
           bookDir,
           async () => {
+            const enteredAt = Date.now()
             await sleep(300)
-            return 'entered'
+            await fs.writeFile(out, JSON.stringify({ entered: [enteredAt, Date.now()] }))
           },
           {
             isAlive: () => true,
             commandLine: async (pid) => {
               if (pid !== 4242) return 'node contender'
-              // The stale owner has been read; wait for the starting gun so
-              // both processes act on that reading at the same moment.
-              while (!(await fs.access(proceed).then(() => true, () => false))) {
-                await sleep(10)
+              if (inspecting) {
+                await fs.writeFile(inspecting, '')
+                while (!(await exists(resume))) await sleep(10)
               }
               return '/usr/bin/vim'
             }
           }
         )
-        await fs.writeFile(out, 'entered')
       } catch (err) {
-        await fs.writeFile(out, isBookBusyError(err) ? 'busy' : String(err))
+        await fs.writeFile(out, JSON.stringify({ busy: isBookBusyError(err), error: String(err) }))
       }
       `
     )
 
-    const outputs = ['a', 'b'].map((name) =>
-      path.join(bookDir, `result-${name}`)
-    )
-    const children = outputs.map((out) =>
-      execFileAsync(process.execPath, [
-        '--import',
-        'tsx',
-        script,
-        bookDir,
-        proceed,
-        out
-      ])
-    )
+    const outA = path.join(bookDir, 'result-a')
+    const outB = path.join(bookDir, 'result-b')
+    const inspecting = path.join(bookDir, 'b-inspecting')
+    const resume = path.join(bookDir, 'b-resume')
+    const spawnWorker = (args: string[]) =>
+      execFileAsync(process.execPath, ['--import', 'tsx', script, ...args])
 
-    // Both children are parked inside commandLine by now; fire the gun.
+    const workerB = spawnWorker([bookDir, outB, inspecting, resume])
+    while (
+      !(await fs.access(inspecting).then(
+        () => true,
+        () => false
+      ))
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    const workerA = spawnWorker([bookDir, outA])
+    // A has had this long to act on the lock B is inspecting.
     await new Promise((resolve) => setTimeout(resolve, 1500))
-    await fs.writeFile(proceed, '')
-    await Promise.all(children)
+    await fs.writeFile(resume, '')
+    await Promise.all([workerA, workerB])
 
-    const results = await Promise.all(
-      outputs.map((out) => fs.readFile(out, 'utf8'))
-    )
-    expect(results.toSorted()).toEqual(['busy', 'entered'])
+    interface WorkerReport {
+      entered?: [number, number]
+      busy?: boolean
+    }
+    const [a, b] = (await Promise.all(
+      [outA, outB].map(
+        async (out) => JSON.parse(await fs.readFile(out, 'utf8')) as unknown
+      )
+    )) as [WorkerReport, WorkerReport]
+    // B held the takeover right throughout its pause, so B enters and A can
+    // only have found B's lock live — or, if A polled after B finished, run
+    // afterwards. Either way the two were never inside together.
+    expect(b.entered).toBeDefined()
+    if (a.entered) {
+      const [aStart, aEnd] = a.entered
+      const [bStart, bEnd] = b.entered!
+      expect(aStart >= bEnd || bStart >= aEnd).toBe(true)
+    } else {
+      expect(a.busy).toBe(true)
+    }
     await expect(fs.access(bookLockPath(bookDir))).rejects.toThrow()
   }, 30_000)
 })

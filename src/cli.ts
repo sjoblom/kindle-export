@@ -3,22 +3,30 @@ import 'dotenv/config'
 
 import { realpathSync } from 'node:fs'
 import fs from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { checkbox, confirm, input, password } from '@inquirer/prompts'
 
-import type { BookMetadata, ContentChunk } from './types'
-import { describeIncompleteCapture } from './capture-status'
 import { cleanPageImages, cleanRenderData, formatBytes } from './cleanup'
 import { loadConfig, saveConfig } from './config'
-import { exportBookMarkdown } from './export-book-markdown'
-import { exportBookPdf } from './export-book-pdf'
-import { launchBrowserContext, runExtraction } from './extract-kindle-book'
+import { launchBrowserContext } from './extract-kindle-book'
 import { fetchLibrary, type LibraryBook } from './kindle-library'
-import { transcribeBook } from './transcribe-book-content'
-import { assert, getEnv, tryReadJsonFile } from './utils'
+import {
+  applyConfig,
+  EMPTY_OPTIONS,
+  type Options,
+  type PipelineEvent,
+  processBook,
+  readContent,
+  readMetadata
+} from './pipeline'
+import { startServer } from './serve'
+import { interactiveLogin } from './session'
+import { assert } from './utils'
+import { isVisionOcrAvailable } from './vision-ocr'
+
+export { applyConfig, type Options } from './pipeline'
 
 const VERSION = '0.3.0'
 
@@ -26,6 +34,7 @@ const HELP = `kindle-export — export Kindle books you own as markdown
 
 Usage
   kindle-export setup                  store your API key and defaults
+  kindle-export serve                  open the web app in your browser
   kindle-export                        pick books from your library, then export
   kindle-export <ASIN...>              capture, transcribe and export (resumes)
   kindle-export login                  sign in to Amazon once, storing the session
@@ -42,8 +51,10 @@ Options
   --out-dir <dir>        where books are written (default: ./out)
   --profile-dir <dir>    browser profile holding your session
                          (default: ~/.kindle-export/profile)
-  --model <name>         vision model used for transcription
+  --model <name>         read pages with an OpenAI model instead of locally
+                         (needs an API key; macOS reads them for free)
   --concurrency <n>      pages transcribed in parallel (default: 16)
+  --port <n>             with 'serve', the port to listen on (default: 8484)
   --otp <code>           2FA code, when there's no terminal to prompt on
   --force                redo every stage, ignoring existing output
   --force-capture        redo page capture
@@ -54,9 +65,16 @@ Options
   -h, --help             show this help
   -v, --version          show the version
 
-Run 'kindle-export setup' once to store your OpenAI key and defaults in
-~/.kindle-export/config.json, then 'kindle-export login' to sign in. The
-session stays on this machine. Settings can also come from flags or a .env
+The web app ('kindle-export serve') walks through the same steps in a browser:
+store the API key, sign in to Amazon, tick the books, download the results.
+
+On macOS, pages are read on this machine for free using Apple's Vision
+framework — no API key, no network, no per-page cost. Pass --model to use an
+OpenAI model instead, which needs a key; that is also the fallback elsewhere.
+
+Run 'kindle-export login' to sign in to Amazon; the session stays on this
+machine. 'kindle-export setup' stores defaults (and a key, if you want one) in
+~/.kindle-export/config.json. Settings can also come from flags or a .env
 file, which take precedence. AMAZON_EMAIL and AMAZON_PASSWORD are optional —
 set them only if you want sign-in scripted rather than doing it yourself.
 
@@ -65,31 +83,16 @@ costs time rather than data. Pass --keep-pages to hold on to them.
 
 Examples
   kindle-export setup
+  kindle-export serve
   kindle-export                        pick from a menu of your books
   kindle-export list --json
   kindle-export B01H4G2J1U
   kindle-export B01H4G2J1U B07PPW5V9C --force-ocr
   kindle-export ocr B01H4G2J1U --model gpt-5-mini`
 
-export interface Options {
-  command: string
-  asins: string[]
-  outDir: string
-  profileDir: string
-  model?: string
-  concurrency?: number
-  otp?: string
-  json: boolean
-  limit?: number
-  formats: Array<'md' | 'pdf'>
-  keepPages: boolean
-  forceCapture: boolean
-  forceOcr: boolean
-  forceExport: boolean
-}
-
 const COMMANDS = new Set([
   'setup',
+  'serve',
   'login',
   'list',
   'clean',
@@ -101,8 +104,6 @@ const COMMANDS = new Set([
 /** Above this many books, offer to filter before showing the picker. */
 const FILTER_PROMPT_THRESHOLD = 30
 
-/** Failed pages listed individually before collapsing to a count. */
-const MAX_REPORTED_FAILURES = 10
 const ASIN_REGEX = /^[A-Z0-9]+$/
 
 /** Books that produced output but are missing pages. */
@@ -110,24 +111,6 @@ const failedBooks = new Set<string>()
 
 /** Shown by `setup` as the suggested transcription model. */
 const DEFAULT_MODEL = 'gpt-4.1-mini'
-
-/** Nothing supplied by hand; applyConfig fills every path in. */
-const EMPTY_OPTIONS: Options = {
-  command: 'all',
-  asins: [],
-  outDir: '',
-  profileDir: '',
-  json: false,
-  formats: ['md'],
-  keepPages: false,
-  forceCapture: false,
-  forceOcr: false,
-  forceExport: false
-}
-
-function defaultProfileDir(): string {
-  return path.join(os.homedir(), '.kindle-export', 'profile')
-}
 
 export function parseArgs(argv: string[]): Options | undefined {
   const positional: string[] = []
@@ -139,6 +122,7 @@ export function parseArgs(argv: string[]): Options | undefined {
   let otp: string | undefined
   let json = false
   let limit: number | undefined
+  let port: number | undefined
   let formats: Array<'md' | 'pdf'> = ['md']
   let force = false
   let forceCapture = false
@@ -182,6 +166,13 @@ export function parseArgs(argv: string[]): Options | undefined {
         break
       case '--limit':
         limit = Number.parseInt(next(), 10)
+        break
+      case '--port':
+        port = Number.parseInt(next(), 10)
+        assert(
+          Number.isInteger(port) && port > 0 && port < 65_536,
+          `--port requires a number between 1 and 65535`
+        )
         break
       case '--format': {
         const requested = next()
@@ -244,6 +235,7 @@ export function parseArgs(argv: string[]): Options | undefined {
     otp,
     json,
     limit,
+    port,
     formats,
     keepPages,
     forceCapture: force || forceCapture,
@@ -257,66 +249,70 @@ function formatDuration(ms: number): string {
   return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
 }
 
-async function readMetadata(
-  outDir: string,
-  asin: string
-): Promise<BookMetadata | undefined> {
-  return tryReadJsonFile<BookMetadata>(path.join(outDir, asin, 'metadata.json'))
-}
-
-async function readContent(
-  outDir: string,
-  asin: string
-): Promise<ContentChunk[] | undefined> {
-  return tryReadJsonFile<ContentChunk[]>(
-    path.join(outDir, asin, 'content.json')
-  )
-}
-
 /**
- * Fill in anything not given as a flag: environment (including `.env`) first,
- * then stored config, then the built-in default.
+ * Render pipeline events the way this CLI always has: prefixed lines, errors
+ * on stderr, transcription progress throttled to one line per 10%.
  */
-export async function applyConfig(options: Options): Promise<Options> {
-  const stored = await loadConfig()
+function renderEvents(asin: string): (event: PipelineEvent) => void {
+  let lastReport = 0
 
-  // `||`, not `??`: a blank path means "not supplied" — `setup` builds options
-  // by hand rather than through parseArgs, and an empty string there used to
-  // survive all the way to `mkdir ''`.
-  options.outDir =
-    options.outDir || getEnv('KINDLE_OUT_DIR') || stored.outDir || 'out'
-  options.profileDir =
-    options.profileDir || getEnv('BROWSER_PROFILE_DIR') || defaultProfileDir()
-  options.model = options.model ?? getEnv('OCR_MODEL') ?? stored.model
-  options.concurrency = options.concurrency ?? stored.concurrency
+  return (event) => {
+    switch (event.kind) {
+      case 'info':
+        console.log(`[${asin}] ${event.message}`)
+        break
+      case 'warn':
+        console.error(`[${asin}] ${event.message}`)
+        break
+      case 'transcribe-progress': {
+        const { done, total } = event
+        const step = Math.max(1, Math.floor(total / 10))
+        if (done === total || done - lastReport >= step) {
+          lastReport = done
+          console.log(`[${asin}] transcribe: ${done}/${total} pages`)
+        }
 
-  // The transcriber reads the key from the environment, so put the stored one
-  // there when nothing else supplied it.
-  if (!getEnv('OPENAI_API_KEY') && stored.openaiApiKey) {
-    // eslint-disable-next-line no-process-env
-    process.env.OPENAI_API_KEY = stored.openaiApiKey
+        break
+      }
+
+      // The extractor narrates capture in the terminal already, and stage
+      // transitions are implied by the lines around them.
+      case 'capture-progress':
+      case 'stage':
+        break
+    }
   }
-
-  return options
 }
 
 async function setup(): Promise<void> {
   const stored = await loadConfig()
+  const localOcr = await isVisionOcrAvailable()
 
   console.log('Settings are stored in your home directory, so kindle-export')
   console.log('works from any folder. Press enter to keep a current value.\n')
 
+  if (localOcr) {
+    console.log('This Mac can read page images by itself, free and offline,')
+    console.log('so there is nothing you have to set up here.\n')
+  }
+
   const openaiApiKey =
     (await password({
-      message: stored.openaiApiKey
-        ? 'OpenAI API key (enter to keep existing):'
-        : 'OpenAI API key:',
+      message: localOcr
+        ? 'OpenAI API key (optional — enter to skip):'
+        : stored.openaiApiKey
+          ? 'OpenAI API key (enter to keep existing):'
+          : 'OpenAI API key:',
       mask: '*'
     })) || stored.openaiApiKey
 
+  // Blank means local OCR where it exists, so don't prefill a model name that
+  // would silently switch reading to a paid API.
   const model = await input({
-    message: 'Model used to read page images:',
-    default: stored.model ?? DEFAULT_MODEL
+    message: localOcr
+      ? 'Model used to read page images (blank = this Mac):'
+      : 'Model used to read page images:',
+    default: stored.model ?? (localOcr ? '' : DEFAULT_MODEL)
   })
 
   const outDir = await input({
@@ -333,7 +329,12 @@ async function setup(): Promise<void> {
 
   console.log(`\nSaved to ${target} (readable only by you).`)
 
-  if (!openaiApiKey) {
+  if (model.trim() && !openaiApiKey) {
+    console.log(
+      `No API key stored, but '${model.trim()}' needs one — leave the model ` +
+        'blank to read pages on this Mac instead.'
+    )
+  } else if (!openaiApiKey && !localOcr) {
     console.log('No API key stored — transcription will not work until one is.')
   }
 
@@ -405,19 +406,21 @@ async function listBookDirs(outDir: string): Promise<string[]> {
 async function login(options: Options): Promise<void> {
   await fs.mkdir(options.profileDir, { recursive: true })
   console.log(`Opening a browser using profile ${options.profileDir}`)
-  console.log('Sign in to Amazon, then close the browser window to finish.\n')
+  console.log(
+    'Sign in to Amazon in the window that opens — it closes by itself once'
+  )
+  console.log("you're signed in.\n")
 
-  const context = await launchBrowserContext({ profileDir: options.profileDir })
-  const page = context.pages()[0] ?? (await context.newPage())
-  await page.goto('https://read.amazon.com/kindle-library')
+  const confirmed = await interactiveLogin(options.profileDir)
 
-  await new Promise<void>((resolve) => {
-    context.on('close', () => {
-      resolve()
-    })
-  })
-
-  console.log('Session saved. You can now run: kindle-export <ASIN>')
+  if (confirmed) {
+    console.log('Session saved. You can now run: kindle-export')
+  } else {
+    console.log(
+      'Could not confirm the sign-in (the window was closed, or it timed out).'
+    )
+    console.log("If you did sign in, you're fine — try: kindle-export list")
+  }
 }
 
 /** Read the library, always closing the browser afterwards. */
@@ -517,175 +520,6 @@ async function selectFromLibrary(options: Options): Promise<string[]> {
   })
 }
 
-/**
- * Say so when the pages on disk are only part of a book.
- *
- * Truncated captures look identical to finished ones — a shorter book — so
- * without this a run that died at chapter 3 exports cleanly and silently.
- */
-function reportIncompleteCapture(asin: string, metadata: BookMetadata): void {
-  const lines = describeIncompleteCapture(metadata)
-  if (!lines) return
-
-  for (const line of lines) {
-    console.error(`[${asin}] ${line}`)
-  }
-  failedBooks.add(asin)
-}
-
-async function capture(asin: string, options: Options): Promise<BookMetadata> {
-  const existing = await readMetadata(options.outDir, asin)
-  if (!options.forceCapture && existing?.pages?.length) {
-    console.log(
-      `[${asin}] capture: reusing ${existing.pages.length} existing page images`
-    )
-    reportIncompleteCapture(asin, existing)
-    return existing
-  }
-
-  console.log(`[${asin}] capture: opening Kindle reader`)
-  // Credentials are optional: the stored session usually covers it, and if it
-  // doesn't, you sign in by hand in the browser window that opens.
-  await runExtraction({
-    asin,
-    amazonEmail: getEnv('AMAZON_EMAIL'),
-    amazonPassword: getEnv('AMAZON_PASSWORD'),
-    outDir: options.outDir,
-    profileDir: options.profileDir,
-    otp: options.otp
-  })
-
-  const metadata = await readMetadata(options.outDir, asin)
-  assert(metadata?.pages?.length, `[${asin}] capture produced no page images`)
-  console.log(`[${asin}] capture: ${metadata.pages.length} page images`)
-  reportIncompleteCapture(asin, metadata)
-
-  // Amazon's render payloads are only useful during the capture itself.
-  const render = await cleanRenderData(options.outDir, asin)
-  if (render.freed) {
-    console.log(
-      `[${asin}] capture: freed ${formatBytes(render.freed)} of render data`
-    )
-  }
-
-  return metadata
-}
-
-async function ocr(
-  asin: string,
-  metadata: BookMetadata,
-  options: Options
-): Promise<ContentChunk[]> {
-  const existing = await readContent(options.outDir, asin)
-  if (
-    !options.forceOcr &&
-    existing?.length &&
-    existing.length >= metadata.pages.length
-  ) {
-    console.log(`[${asin}] transcribe: reusing ${existing.length} chunks`)
-    return existing
-  }
-
-  let lastReport = 0
-  const { content, failedPages } = await transcribeBook({
-    asin,
-    outDir: options.outDir,
-    model: options.model,
-    concurrency: options.concurrency,
-    force: options.forceOcr,
-    onProgress: (done, total) => {
-      // One line per 10%, so long books stay readable in a terminal.
-      const step = Math.max(1, Math.floor(total / 10))
-      if (done === total || done - lastReport >= step) {
-        lastReport = done
-        console.log(`[${asin}] transcribe: ${done}/${total} pages`)
-      }
-    }
-  })
-
-  assert(content.length, `[${asin}] transcription produced no text`)
-
-  if (failedPages.length) {
-    // The book is still worth exporting, but it has holes in it and the user
-    // has to know which pages, and that re-running will retry just those.
-    console.error(
-      `[${asin}] ${failedPages.length} of ${metadata.pages.length} pages could not be read:`
-    )
-    for (const failure of failedPages.slice(0, MAX_REPORTED_FAILURES)) {
-      console.error(`  page ${failure.page} (${failure.error})`)
-    }
-    if (failedPages.length > MAX_REPORTED_FAILURES) {
-      console.error(
-        `  ...and ${failedPages.length - MAX_REPORTED_FAILURES} more`
-      )
-    }
-    console.error(
-      `[${asin}] the export below is missing those pages — re-run to retry just them`
-    )
-    failedBooks.add(asin)
-  }
-
-  // Page images are only the input to this step. Once every page has text
-  // they're dead weight, and re-capturing costs time rather than data.
-  if (!options.keepPages && !failedPages.length) {
-    const pages = await cleanPageImages(options.outDir, asin)
-    if (pages.freed) {
-      console.log(
-        `[${asin}] transcribe: freed ${formatBytes(pages.freed)} of page images`
-      )
-    }
-  }
-
-  return content
-}
-
-async function processBook(asin: string, options: Options): Promise<string> {
-  const startedAt = Date.now()
-
-  const metadata =
-    options.command === 'ocr' || options.command === 'export'
-      ? await readMetadata(options.outDir, asin)
-      : await capture(asin, options)
-  assert(
-    metadata?.pages?.length,
-    `[${asin}] no captured pages — run 'kindle-export capture ${asin}' first`
-  )
-
-  if (options.command === 'capture') {
-    return path.join(options.outDir, asin)
-  }
-
-  const content =
-    options.command === 'export'
-      ? await readContent(options.outDir, asin)
-      : await ocr(asin, metadata, options)
-  assert(
-    content?.length,
-    `[${asin}] no transcribed text — run 'kindle-export ocr ${asin}' first`
-  )
-
-  if (options.command === 'ocr') {
-    return path.join(options.outDir, asin, 'content.json')
-  }
-
-  const written: string[] = []
-  for (const format of options.formats) {
-    written.push(
-      format === 'pdf'
-        ? await exportBookPdf({ asin, outDir: options.outDir })
-        : await exportBookMarkdown({ asin, outDir: options.outDir })
-    )
-  }
-
-  console.log(
-    `[${asin}] done in ${formatDuration(Date.now() - startedAt)}: ${written
-      .map((file) => path.resolve(file))
-      .join(', ')}`
-  )
-
-  return written[0]!
-}
-
 async function main() {
   let options: Options | undefined
   try {
@@ -706,6 +540,11 @@ async function main() {
   }
 
   options = await applyConfig(options)
+
+  if (options.command === 'serve') {
+    await startServer(options)
+    return
+  }
 
   if (options.command === 'clean') {
     await clean(options)
@@ -732,7 +571,19 @@ async function main() {
   const failures: string[] = []
   for (const asin of options.asins) {
     try {
-      await processBook(asin, options)
+      const result = await processBook(asin, options, renderEvents(asin))
+
+      if (result.incompleteCapture?.length || result.failedPages.length) {
+        failedBooks.add(asin)
+      }
+
+      if (options.command === 'all' || options.command === 'export') {
+        console.log(
+          `[${asin}] done in ${formatDuration(result.durationMs)}: ${result.outputs
+            .map((file) => path.resolve(file))
+            .join(', ')}`
+        )
+      }
     } catch (err) {
       failures.push(asin)
       console.error(`[${asin}] failed: ${(err as Error)?.message ?? err}`)

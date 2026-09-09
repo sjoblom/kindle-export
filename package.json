@@ -15,10 +15,14 @@
     "kindle-export": "./dist/cli.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "bin"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "run-s build:*",
+    "build:js": "tsup",
+    "build:ocr": "sh scripts/build-vision-ocr.sh",
+    "package": "bash scripts/package-app.sh",
     "kindle-export": "tsx src/cli.ts",
     "test": "run-s test:*",
     "test:format": "prettier --check \"**/*.{js,ts,tsx}\"",

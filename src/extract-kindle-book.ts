@@ -190,7 +190,12 @@ export async function launchBrowserContext(
           // disable chrome's passkey popups
           '--disable-features=WebAuthn',
           // disable chrome creating 1GB temp directories on each run
-          '--disable-features=MacAppCodeSignClone'
+          '--disable-features=MacAppCodeSignClone',
+          // keep a minimized/covered window rendering and firing timers —
+          // without these, hiding the capture window stalls page turning
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding'
         ],
         ignoreDefaultArgs: [
           // disable chrome's default automation detection flag
@@ -273,6 +278,47 @@ export async function launchBrowserContext(
   throw new Error('failed to initialize browser context')
 }
 
+async function setWindowState(
+  page: Page,
+  state: 'minimized' | 'normal'
+): Promise<void> {
+  const session = await page.context().newCDPSession(page)
+  try {
+    const { windowId } = await session.send('Browser.getWindowForTarget')
+    await session.send('Browser.setWindowBounds', {
+      windowId,
+      bounds: { windowState: state }
+    })
+  } finally {
+    await session.detach().catch(() => {})
+  }
+}
+
+/**
+ * Park the automation window in the Dock so it doesn't sit on top of whatever
+ * the user is doing — left in front, it invites exactly the clicks and
+ * closings that break a capture. Playwright drives the page over CDP rather
+ * than OS events, and the launch args disable background throttling, so a
+ * minimized window keeps turning pages.
+ */
+export async function hideBrowserWindow(page: Page): Promise<void> {
+  try {
+    await setWindowState(page, 'minimized')
+  } catch {
+    // Cosmetic — a window that stays visible is not a failure.
+  }
+}
+
+/** Bring a hidden automation window back when the user is needed in it. */
+export async function showBrowserWindow(page: Page): Promise<void> {
+  try {
+    await setWindowState(page, 'normal')
+    await page.bringToFront()
+  } catch {
+    // The window is already visible at worst.
+  }
+}
+
 export interface ExtractBookOptions {
   asin: string
   /**
@@ -286,6 +332,11 @@ export interface ExtractBookOptions {
   outDir?: string
   /** 2FA code, when the caller has one and no TTY is available to prompt on. */
   otp?: string
+  /**
+   * Minimize the automation window while capturing. It is brought back
+   * automatically if Amazon asks for a sign-in.
+   */
+  hideWindow?: boolean
 }
 
 /** How long to wait for a person to complete sign-in by hand. */
@@ -299,7 +350,7 @@ export async function extractBook(
   context: BrowserContext,
   opts: ExtractBookOptions
 ): Promise<void> {
-  const { asin, amazonEmail, amazonPassword, otp } = opts
+  const { asin, amazonEmail, amazonPassword, otp, hideWindow } = opts
   const asinL = asin.toLowerCase()
 
   const outDir = path.join(opts.outDir ?? 'out', asin)
@@ -329,6 +380,9 @@ export async function extractBook(
 
   // Create a fresh page for this book extraction
   const page = await context.newPage()
+  if (hideWindow) {
+    await hideBrowserWindow(page)
+  }
 
   try {
     // Kindle's "Most Recent Page Read" dialog appears when the book content
@@ -555,12 +609,19 @@ export async function extractBook(
           'Amazon needs you to sign in. Complete sign-in in the browser window...'
         )
 
+        // A hidden window has to come back for this — the user can't sign in
+        // to a window they can't see.
+        await showBrowserWindow(page)
+
         await page.waitForURL(
           (url) => !/\/ap\/signin/.test(new URL(url).pathname),
           { timeout: MANUAL_SIGN_IN_TIMEOUT_MS }
         )
 
         logInfo('Signed in.')
+        if (hideWindow) {
+          await hideBrowserWindow(page)
+        }
       } else {
         await page.locator('input[type="email"]').fill(amazonEmail)
         await page.locator('input[type="submit"]').click()
@@ -637,13 +698,19 @@ export async function extractBook(
       await dismissReaderPopoverMenu()
     }
 
-    async function goToPage(pageNumber: number) {
+    /**
+     * Open the reader menu and click "Go to Page"/"Go to Location".
+     *
+     * The popover animates open and can be closed from under us by the "Most
+     * Recent Page Read" dialog handler, so a single instant `isVisible` read
+     * is a coin toss — it has to be awaited, and the whole open retried.
+     */
+    async function openGoToModal(): Promise<boolean> {
       await dismissPossibleAlert()
       await dismissReaderPopoverMenu()
       await page.locator('#reader-header').hover({ force: true })
       await delay(200)
       await page.locator('ion-button[aria-label="Reader menu"]').click()
-      await delay(500)
 
       const goToPageItem = page.locator('ion-item[role="listitem"]', {
         hasText: 'Go to Page'
@@ -652,12 +719,30 @@ export async function extractBook(
         hasText: 'Go to Location'
       })
 
+      await goToPageItem
+        .or(goToLocationItem)
+        .first()
+        .waitFor({ timeout: 5000 })
+        .catch(() => {})
+
       if (await goToPageItem.isVisible()) {
         await goToPageItem.click()
       } else if (await goToLocationItem.isVisible()) {
         await goToLocationItem.click()
       } else {
         await dismissReaderPopoverMenu()
+        return false
+      }
+
+      return true
+    }
+
+    async function goToPage(pageNumber: number) {
+      let opened = false
+      for (let attempt = 0; attempt < 3 && !opened; attempt++) {
+        opened = await openGoToModal()
+      }
+      if (!opened) {
         throw new Error(
           'Unable to find "Go to Page" or "Go to Location" menu item'
         )
@@ -724,6 +809,9 @@ export async function extractBook(
     }
 
     async function walkToPage(pageNumber: number) {
+      let previousPage: number | undefined
+      let stuck = 0
+
       for (let attempts = 0; attempts < 500; attempts++) {
         const pageNav = await readPageNav()
         if (!pageNav) {
@@ -765,6 +853,38 @@ export async function extractBook(
             ? '.kr-chevron-container-left'
             : '.kr-chevron-container-right'
         const arrowKey = direction === 'left' ? 'ArrowLeft' : 'ArrowRight'
+
+        // A walk that stops moving has hit something. If the chevron in our
+        // direction is gone, that something is the edge of the book — the
+        // footer never reports the final spread of some books (it reads
+        // "page 144 of 145" on the last screen), so a target one past the
+        // last reported page is as reached as it will ever be. Kindle removes
+        // the chevron mid-render sometimes, so require it missing on repeated
+        // stalled reads before believing it.
+        if (currentPage !== undefined && currentPage === previousPage) {
+          stuck++
+          const chevronMissing =
+            (await page
+              .locator(chevronSelector)
+              .count()
+              .catch(() => 1)) === 0
+          if (chevronMissing && stuck >= 2) {
+            warnInfo(
+              `stopping walk at page ${currentPage}: no ${direction} chevron, ` +
+                `so page ${pageNumber} is past the edge of the book`
+            )
+            return
+          }
+
+          if (stuck >= 5) {
+            throw new Error(
+              `Unable to walk to page ${pageNumber}; stuck at page ${currentPage}`
+            )
+          }
+        } else {
+          stuck = 0
+        }
+        previousPage = currentPage
         const src = await page
           .locator(krRendererMainImageSelector)
           .getAttribute('src')
@@ -1236,8 +1356,12 @@ export async function extractBook(
 
     if (initialPageNav?.page !== undefined) {
       warnInfo(`resetting back to initial page ${initialPageNav.page}...`)
-      // Reset back to the initial page
-      await goToPage(initialPageNav.page)
+      // Restoring the reading position is a courtesy: the capture is already
+      // complete and on disk, so nothing that goes wrong here is allowed to
+      // fail the run.
+      await goToPage(initialPageNav.page).catch((err: Error) => {
+        warnInfo(`could not restore the reading position: ${err.message}`)
+      })
     }
   } finally {
     // Close only this page, not the whole browser context

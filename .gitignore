@@ -4,7 +4,12 @@ node_modules/
 
 # Build output
 dist/
+dist-app/
 *.tsbuildinfo
+
+# Compiled from native/, rebuilt by `pnpm build`
+bin/
+tmp/
 
 # Credentials — never commit these
 .env

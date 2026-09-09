@@ -4,6 +4,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 
 import type { BookMetadata, ContentChunk } from './types'
+import { readContentChunks } from './content-store'
 import { formatContentChunks } from './postprocess-text'
 import { resolveBookSections } from './toc-sections'
 import { assert, readJsonFile } from './utils'
@@ -69,9 +70,7 @@ export async function exportBookMarkdown({
 }: ExportBookMarkdownOptions): Promise<string> {
   const outDir = path.join(root, asin)
 
-  const content = await readJsonFile<ContentChunk[]>(
-    path.join(outDir, 'content.json')
-  )
+  const content = (await readContentChunks(outDir)) ?? []
   const metadata = await readJsonFile<BookMetadata>(
     path.join(outDir, 'metadata.json')
   )

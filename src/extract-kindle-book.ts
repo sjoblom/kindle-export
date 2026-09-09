@@ -1,5 +1,6 @@
 import 'dotenv/config'
 
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -28,6 +29,7 @@ import {
   hashObject,
   normalizeAuthors,
   normalizeBookMetadata,
+  PAGE_IMAGES_DIR,
   parseJsonpResponse,
   tryReadJsonFile
 } from './utils'
@@ -355,7 +357,7 @@ export async function extractBook(
 
   const outDir = path.join(opts.outDir ?? 'out', asin)
   const bookDataDir = path.join(outDir, 'data')
-  const pageScreenshotsDir = path.join(outDir, 'pages')
+  const pageScreenshotsDir = path.join(outDir, PAGE_IMAGES_DIR)
   const metadataPath = path.join(outDir, 'metadata.json')
   await fs.mkdir(bookDataDir, { recursive: true })
   await fs.mkdir(pageScreenshotsDir, { recursive: true })
@@ -364,6 +366,10 @@ export async function extractBook(
   const bookReaderUrl = `https://read.amazon.com/?asin=${asin}`
 
   const result: SetRequired<Partial<BookMetadata>, 'pages' | 'nav'> = {
+    // Stamped before the first page is written, so every image this run
+    // produces is tied to it. Anything transcribed from an earlier capture of
+    // the same book carries a different id and can be recognised as stale.
+    captureId: randomUUID(),
     pages: [],
     // locationMap: { locations: [], navigationUnit: [] },
     nav: {
@@ -1230,19 +1236,22 @@ export async function extractBook(
         `no buffer found for src: ${src} (index ${index}; page ${currentNavPage})`
       )
 
-      const screenshotPath = path.join(
-        pageScreenshotsDir,
+      // Recorded relative to the book directory rather than as the path this
+      // process happens to write to: the tree can then be moved, and a later
+      // stage run from a different working directory still finds the image.
+      const screenshot = path.join(
+        PAGE_IMAGES_DIR,
         `${index}`.padStart(pageNumberPaddingAmount, '0') +
           '-' +
           `${currentNavPage}`.padStart(pageNumberPaddingAmount, '0') +
           '.png'
       )
 
-      await fs.writeFile(screenshotPath, renderedPageImageBuffer)
+      await fs.writeFile(path.join(outDir, screenshot), renderedPageImageBuffer)
       const pageChunk = {
         index,
         page: currentNavPage,
-        screenshot: screenshotPath
+        screenshot
       }
       result.pages.push(pageChunk)
       capture.lastPage = currentNavPage

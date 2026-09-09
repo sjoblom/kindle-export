@@ -6,7 +6,8 @@ import path from 'node:path'
 
 import PDFDocument from 'pdfkit'
 
-import type { BookMetadata, ContentChunk } from './types'
+import type { BookMetadata } from './types'
+import { readContentChunks } from './content-store'
 import { formatContentChunks } from './postprocess-text'
 import { resolveBookSections } from './toc-sections'
 import { assert } from './utils'
@@ -28,9 +29,7 @@ export async function exportBookPdf({
 }: ExportBookPdfOptions): Promise<string> {
   const outDir = path.join(root, asin)
 
-  const content = JSON.parse(
-    await fsp.readFile(path.join(outDir, 'content.json'), 'utf8')
-  ) as ContentChunk[]
+  const content = (await readContentChunks(outDir)) ?? []
   const metadata = JSON.parse(
     await fsp.readFile(path.join(outDir, 'metadata.json'), 'utf8')
   ) as BookMetadata

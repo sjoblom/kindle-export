@@ -5,6 +5,12 @@ import type { BookMetadata, ContentChunk } from './types'
 import { describeIncompleteCapture } from './capture-status'
 import { cleanPageImages, cleanRenderData, formatBytes } from './cleanup'
 import { loadConfig } from './config'
+import {
+  invalidateContent,
+  readContentChunks,
+  readContentStore,
+  selectReusableChunks
+} from './content-store'
 import { exportBookMarkdown } from './export-book-markdown'
 import { exportBookPdf } from './export-book-pdf'
 import { runExtraction } from './extract-kindle-book'
@@ -130,9 +136,7 @@ export async function readContent(
   outDir: string,
   asin: string
 ): Promise<ContentChunk[] | undefined> {
-  return tryReadJsonFile<ContentChunk[]>(
-    path.join(outDir, asin, 'content.json')
-  )
+  return readContentChunks(path.join(outDir, asin))
 }
 
 /**
@@ -211,6 +215,13 @@ async function capture(
 
   const metadata = await readMetadata(options.outDir, asin)
   assert(metadata?.pages?.length, `capture produced no page images`)
+
+  // The page images the previous transcription was read from no longer exist,
+  // so that text is no longer about this book's pages. Dropping it here is what
+  // makes `--force-capture` re-export the book that was just captured instead
+  // of quietly re-exporting the one before it.
+  await invalidateContent(path.join(options.outDir, asin))
+
   emit({
     kind: 'info',
     message: `capture: ${metadata.pages.length} page images`
@@ -235,10 +246,16 @@ async function ocr(
   options: Options,
   emit: EmitEvent
 ): Promise<{ content: ContentChunk[]; failedPages: FailedPage[] }> {
-  const existing = await readContent(options.outDir, asin)
+  // Not just "enough chunks exist": chunks left over from an earlier capture
+  // of the same book count to exactly the same number and describe different
+  // pages entirely, so only text that belongs to the capture on disk counts.
+  const existing = selectReusableChunks(
+    await readContentStore(path.join(options.outDir, asin)),
+    metadata
+  )
   if (
     !options.forceOcr &&
-    existing?.length &&
+    existing.length &&
     existing.length >= metadata.pages.length
   ) {
     emit({
@@ -337,7 +354,13 @@ export async function processBook(
   let content: ContentChunk[] | undefined
   let failedPages: FailedPage[] = []
   if (options.command === 'export') {
-    content = await readContent(options.outDir, asin)
+    // Same check as the transcribe stage: text left behind by an earlier
+    // capture is not this book's text, and exporting it would look like it
+    // worked.
+    content = selectReusableChunks(
+      await readContentStore(path.join(options.outDir, asin)),
+      metadata
+    )
   } else {
     const transcribed = await ocr(asin, metadata, options, emit)
     content = transcribed.content

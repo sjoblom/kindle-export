@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises'
+import path from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 
@@ -188,10 +189,39 @@ export async function tryReadJsonFile<T = unknown>(
   } catch {}
 }
 
+/** The directory holding a book's page images, inside its own directory. */
+export const PAGE_IMAGES_DIR = 'pages'
+
+/**
+ * Turn a stored `screenshot` path into one that can actually be opened.
+ *
+ * Captures now store `pages/000-001.png`, relative to the book directory, so
+ * the output tree survives being moved and so transcription run from another
+ * working directory finds the images. Two older forms are still on disk: an
+ * absolute path, and whatever relative path the caller passed to capture —
+ * usually `out/<asin>/pages/000-001.png`, which only resolves from the
+ * directory that capture ran in. Without this, running OCR from elsewhere
+ * failed with the thoroughly misleading "page images are gone (cleaned up)".
+ */
+export function resolveScreenshotPath(
+  bookDir: string,
+  screenshot: string
+): string {
+  if (path.isAbsolute(screenshot)) return screenshot
+
+  const [first] = screenshot.split(/[/\\]/)
+  if (first === PAGE_IMAGES_DIR) return path.join(bookDir, screenshot)
+
+  // An older path, relative to a working directory we can only assume was
+  // this one. Nothing better is recoverable from the string itself.
+  return screenshot
+}
+
 const bookMetadataFieldOrder: (keyof BookMetadata)[] = [
   'meta',
   'info',
   'nav',
+  'captureId',
   'capture',
   'toc',
   'pages',

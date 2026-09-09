@@ -1,8 +1,9 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
-import type { BookMetadata, ContentChunk } from './types'
+import type { BookMetadata } from './types'
 import { describeIncompleteCapture } from './capture-status'
+import { readContentChunks } from './content-store'
 import { normalizeAuthors, tryReadJsonFile } from './utils'
 
 /**
@@ -47,9 +48,7 @@ async function scanBook(
   const metadata = await tryReadJsonFile<BookMetadata>(
     path.join(bookDir, 'metadata.json')
   )
-  const content = await tryReadJsonFile<ContentChunk[]>(
-    path.join(bookDir, 'content.json')
-  )
+  const content = await readContentChunks(bookDir)
 
   const exports: BookExportFile[] = []
   const entries = await fs

@@ -4,7 +4,8 @@ import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { BookMetadata, ContentChunk } from './types'
+import type { OcrEngine } from './ocr-engine'
+import type { BookMetadata, ContentChunk, ContentStore } from './types'
 import {
   type ChatCompletionClient,
   transcribeBook
@@ -19,20 +20,41 @@ async function writeBook(
   pageCount: number,
   toc: Array<{ label: string; page: number }> = [
     { label: 'Chapter One', page: 1 }
-  ]
+  ],
+  {
+    captureId,
+    startPage = 1,
+    absoluteScreenshots = false
+  }: {
+    captureId?: string
+    startPage?: number
+    /** Write the pre-relative-path form, as older captures left on disk. */
+    absoluteScreenshots?: boolean
+  } = {}
 ): Promise<void> {
   const outDir = path.join(root, ASIN)
   await fs.mkdir(path.join(outDir, 'pages'), { recursive: true })
 
   const pages = []
   for (let index = 0; index < pageCount; index++) {
-    const screenshot = path.join(outDir, 'pages', `${index}.png`)
+    // Captures store the image relative to the book directory.
+    const screenshot = path.join('pages', `${index}.png`)
     // Content is irrelevant: the client is faked, it just has to be readable.
-    await fs.writeFile(screenshot, Buffer.from([0x89, 0x50, 0x4e, 0x47]))
-    pages.push({ index, page: index + 1, screenshot })
+    await fs.writeFile(
+      path.join(outDir, screenshot),
+      Buffer.from([0x89, 0x50, 0x4e, 0x47])
+    )
+    pages.push({
+      index,
+      page: startPage + index,
+      screenshot: absoluteScreenshots
+        ? path.join(outDir, screenshot)
+        : screenshot
+    })
   }
 
   const metadata: Partial<BookMetadata> = {
+    ...(captureId ? { captureId } : {}),
     pages,
     toc: toc.map((item, i) => ({ ...item, positionId: i, depth: 0 })) as any
   }
@@ -44,9 +66,11 @@ async function writeBook(
 }
 
 async function readContentJson(): Promise<ContentChunk[]> {
-  return JSON.parse(
+  const raw = JSON.parse(
     await fs.readFile(path.join(root, ASIN, 'content.json'), 'utf8')
-  ) as ContentChunk[]
+  ) as ContentStore | ContentChunk[]
+
+  return Array.isArray(raw) ? raw : raw.chunks
 }
 
 /** A client whose reply (or thrown error) is decided per call. */
@@ -157,6 +181,7 @@ describe('transcribeBook', () => {
     const { content, failedPages } = await transcribeBook({
       asin: ASIN,
       outDir: root,
+      concurrency: 1,
       client
     })
 
@@ -191,6 +216,7 @@ describe('transcribeBook', () => {
     await transcribeBook({
       asin: ASIN,
       outDir: root,
+      concurrency: 1,
       maxRetries: 1,
       client: fakeClient((i) => (i === 0 ? '' : 'page two'))
     })
@@ -271,6 +297,7 @@ describe('transcribeBook', () => {
     const { content } = await transcribeBook({
       asin: ASIN,
       outDir: root,
+      concurrency: 1,
       force: true,
       client
     })
@@ -296,5 +323,184 @@ describe('transcribeBook', () => {
       [2, 3],
       [3, 3]
     ])
+  })
+
+  it('drops text read from a previous capture of the same book', async () => {
+    await writeBook(2, undefined, { captureId: 'capture-a' })
+    await transcribeBook({
+      asin: ASIN,
+      outDir: root,
+      concurrency: 1,
+      client: fakeClient(() => 'old text')
+    })
+    expect(await readContentJson()).toHaveLength(2)
+
+    // A re-capture: one page, numbered 7, and a new identity.
+    await writeBook(1, [{ label: 'Chapter One', page: 7 }], {
+      captureId: 'capture-b',
+      startPage: 7
+    })
+
+    const client = fakeClient(() => 'new text')
+    const { content } = await transcribeBook({
+      asin: ASIN,
+      outDir: root,
+      concurrency: 1,
+      client
+    })
+
+    // Keyed on index alone the old chunk matched, so this used to cost no
+    // calls at all and export the previous capture's pages 1 and 2.
+    expect(client.calls).toBe(1)
+    expect(content).toEqual([
+      expect.objectContaining({ index: 0, page: 7, text: 'new text' })
+    ])
+  })
+
+  it('drops legacy text whose pages the capture no longer has', async () => {
+    await writeBook(1, [{ label: 'Chapter One', page: 7 }], { startPage: 7 })
+    // The bare-array shape written before captures had an identity, describing
+    // a capture that is plainly not the one on disk.
+    await fs.writeFile(
+      path.join(root, ASIN, 'content.json'),
+      JSON.stringify([
+        { index: 0, page: 1, text: 'old page one', screenshot: 'pages/0.png' },
+        { index: 1, page: 2, text: 'old page two', screenshot: 'pages/1.png' }
+      ])
+    )
+
+    const client = fakeClient(() => 'new text')
+    const { content } = await transcribeBook({
+      asin: ASIN,
+      outDir: root,
+      concurrency: 1,
+      client
+    })
+
+    expect(client.calls).toBe(1)
+    expect(content.map((c) => c.text)).toEqual(['new text'])
+  })
+
+  it('saves each page as it finishes, so an interruption keeps them', async () => {
+    await writeBook(2)
+
+    let releaseSecondPage: (() => void) | undefined
+    let secondPageStarted!: () => void
+    const secondPageReached = new Promise<void>((resolve) => {
+      secondPageStarted = resolve
+    })
+
+    const engine: OcrEngine = {
+      name: 'fake',
+      costsMoney: false,
+      async recognize({ imagePath }) {
+        if (imagePath.endsWith('0.png')) return 'page one'
+
+        // Stands in for a Ctrl+C: page two never comes back until the test has
+        // looked at what page one left behind.
+        secondPageStarted()
+        await new Promise<void>((resolve) => {
+          releaseSecondPage = resolve
+        })
+        throw new Error('interrupted')
+      },
+      async close() {}
+    }
+
+    const run = transcribeBook({
+      asin: ASIN,
+      outDir: root,
+      concurrency: 1,
+      maxRetries: 1,
+      engine
+    })
+    await secondPageReached
+
+    // The point of the fix: page one is on disk while the run is still going.
+    // Written once at the end, this file would not exist yet, and a run killed
+    // here threw away every page it had already paid to read.
+    await vi.waitFor(
+      async () => {
+        expect((await readContentJson()).map((c) => c.text)).toEqual([
+          'page one'
+        ])
+      },
+      { timeout: 5000, interval: 25 }
+    )
+
+    releaseSecondPage!()
+    const { content, failedPages } = await run
+    expect(content.map((c) => c.text)).toEqual(['page one'])
+    expect(failedPages).toHaveLength(1)
+    expect(await readContentJson()).toHaveLength(1)
+  })
+
+  it('resumes from the pages an interrupted run saved', async () => {
+    await writeBook(2)
+    // What the run above leaves behind.
+    await fs.writeFile(
+      path.join(root, ASIN, 'content.json'),
+      JSON.stringify({
+        chunks: [
+          { index: 0, page: 1, text: 'page one', screenshot: 'pages/0.png' }
+        ]
+      })
+    )
+
+    const client = fakeClient(() => 'page two')
+    const { content } = await transcribeBook({
+      asin: ASIN,
+      outDir: root,
+      concurrency: 1,
+      client
+    })
+
+    expect(client.calls).toBe(1)
+    expect(content.map((c) => c.text)).toEqual(['page one', 'page two'])
+  })
+
+  it('finds page images when run from another working directory', async () => {
+    await writeBook(2)
+
+    const elsewhere = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'kindle-export-cwd-')
+    )
+    const originalCwd = process.cwd()
+    process.chdir(elsewhere)
+
+    try {
+      // Paths stored relative to the book directory used to be resolved
+      // against the working directory, so this failed with the thoroughly
+      // misleading "page images are gone (cleaned up)".
+      const { content, failedPages } = await transcribeBook({
+        asin: ASIN,
+        outDir: path.resolve(root),
+        concurrency: 1,
+        client: fakeClient(() => 'read from elsewhere')
+      })
+
+      expect(failedPages).toEqual([])
+      expect(content.map((c) => c.text)).toEqual([
+        'read from elsewhere',
+        'read from elsewhere'
+      ])
+    } finally {
+      process.chdir(originalCwd)
+      await fs.rm(elsewhere, { recursive: true, force: true })
+    }
+  })
+
+  it('still reads captures that stored absolute image paths', async () => {
+    await writeBook(1, undefined, { absoluteScreenshots: true })
+
+    const { content, failedPages } = await transcribeBook({
+      asin: ASIN,
+      outDir: root,
+      concurrency: 1,
+      client: fakeClient(() => 'old capture, still readable')
+    })
+
+    expect(failedPages).toEqual([])
+    expect(content[0]!.text).toBe('old capture, still readable')
   })
 })

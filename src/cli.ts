@@ -10,6 +10,7 @@ import { checkbox, confirm, input, password } from '@inquirer/prompts'
 
 import { cleanPageImages, cleanRenderData, formatBytes } from './cleanup'
 import { loadConfig, saveConfig } from './config'
+import { readContentStore, selectReusableChunks } from './content-store'
 import { launchBrowserContext } from './extract-kindle-book'
 import { fetchLibrary, type LibraryBook } from './kindle-library'
 import {
@@ -18,7 +19,6 @@ import {
   type Options,
   type PipelineEvent,
   processBook,
-  readContent,
   readMetadata
 } from './pipeline'
 import { startServer } from './serve'
@@ -366,16 +366,24 @@ async function clean(options: Options): Promise<void> {
     // silently becomes a re-capture.
     let pages = { freed: 0, removed: [] as string[] }
     if (!options.keepPages) {
-      const content = await readContent(options.outDir, asin)
       const metadata = await readMetadata(options.outDir, asin)
+      // Only text belonging to the capture that is on disk counts as done:
+      // chunks left over from a previous capture would otherwise licence
+      // deleting page images that have never been read.
+      const content = metadata
+        ? selectReusableChunks(
+            await readContentStore(path.join(options.outDir, asin)),
+            metadata
+          )
+        : []
       const complete =
-        !!content?.length &&
+        !!content.length &&
         !!metadata?.pages?.length &&
         content.length >= metadata.pages.length
 
       if (complete) {
         pages = await cleanPageImages(options.outDir, asin)
-      } else if (content?.length) {
+      } else if (content.length) {
         console.log(
           `[${asin}] keeping page images: transcription is incomplete`
         )

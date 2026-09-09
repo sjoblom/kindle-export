@@ -6,6 +6,16 @@ export interface BookMetadata {
   pages: PageChunk[]
   locationMap: AmazonRenderLocationMap
   /**
+   * Identifies this particular set of page images.
+   *
+   * Re-capturing a book replaces every image, which makes text transcribed
+   * from the previous ones text about a different set of pages — indexes and
+   * page numbers alone can't tell the two apart. `content.json` records the id
+   * it was read from so a stale transcription can be spotted instead of
+   * silently exported. Absent on books captured before this was recorded.
+   */
+  captureId?: string
+  /**
    * How the capture ended. Absent on books captured before this was recorded,
    * which are assumed complete rather than forcing a re-capture of a library.
    */
@@ -58,6 +68,12 @@ export interface Nav {
 export interface PageChunk {
   index: number
   page: number
+  /**
+   * The page image, relative to the book directory (`pages/000-001.png`), so
+   * the output tree can be moved and so a later stage run from a different
+   * working directory still finds it. Captures made before this stored
+   * whatever path the caller passed; `resolveScreenshotPath` reads both.
+   */
   screenshot: string
 }
 
@@ -65,7 +81,18 @@ export interface ContentChunk {
   index: number
   page: number
   text: string
+  /** As `PageChunk.screenshot` — relative to the book directory. */
   screenshot: string
+}
+
+/**
+ * A book's `content.json`: the transcribed text plus the capture it came from.
+ *
+ * Older files are a bare `ContentChunk[]`; see `content-store.ts`.
+ */
+export interface ContentStore {
+  captureId?: string
+  chunks: ContentChunk[]
 }
 
 export interface PageNav {

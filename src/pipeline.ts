@@ -2,6 +2,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import type { BookMetadata, ContentChunk } from './types'
+import { withBookLock } from './book-lock'
 import {
   type BookCompleteness,
   bookCompleteness,
@@ -355,6 +356,22 @@ export async function processBook(
   asin: string,
   options: Options,
   emit: EmitEvent = () => {}
+): Promise<BookResult> {
+  // The CLI and the web app share one output tree. Two runs writing the same
+  // book at once — one capturing while the other transcribes what's there so
+  // far — end with one of them deleting the other's work, so the second run
+  // is refused with a message naming the first.
+  return withBookLock(
+    path.join(options.outDir, asin),
+    () => processBookLocked(asin, options, emit),
+    { command: options.command }
+  )
+}
+
+async function processBookLocked(
+  asin: string,
+  options: Options,
+  emit: EmitEvent
 ): Promise<BookResult> {
   const startedAt = Date.now()
   const bookDir = path.join(options.outDir, asin)

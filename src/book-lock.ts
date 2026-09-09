@@ -12,27 +12,37 @@ import { isProcessAlive, readProcessCommandLine } from './browser-profile-lock'
  * nothing stopped `kindle-export ocr X` from reading a metadata.json the web
  * app was still appending pages to, transcribing half a book, and having the
  * result deleted when that capture finished — or `clean` from deleting the
- * page images a transcription was reading. A small owner file in the book
- * directory makes the second run say so instead.
+ * page images a transcription was reading. A lock in the book directory makes
+ * the second run say so instead.
  *
- * Two atomic filesystem operations carry the whole protocol:
+ * The lock is a directory, `.lock`, holding exactly one owner file whose name
+ * is unique to one acquisition: `owner-<pid>-<token>.json`. That shape is the
+ * whole point. Earlier versions kept a single lock file and recovered a stale
+ * one by deleting or renaming it, and every such step raced: a contender that
+ * judged the lock stale, paused, and resumed would delete whatever occupied
+ * that name by then — a fresh owner's lock — and two runs entered together.
+ * Adding a second lock to guard the first only moved the same race onto the
+ * second lock's recovery.
  *
- * - Taking the lock is `link()` from a fully written temp file. Either the
- *   lock name is free and the link succeeds, or it exists and the link fails
- *   with EEXIST — and a lock that exists always has its whole owner record in
- *   it, never a half-written one.
- * - Everything that looks at an existing lock and acts on what it saw —
- *   reading the owner, deciding it is stale, moving it aside, linking a
- *   replacement — happens while holding a second, short-lived lock: a
- *   directory made with `mkdir()`, which only one process can create. That
- *   is what makes "stale" a decision about the file that is there *now*. A
- *   contender that read the owner first, then paused, resumes still holding
- *   that directory; nobody else has been able to replace the file behind its
- *   back. Without it, a paused contender's rename would move a fresh owner's
- *   lock aside and two runs would both enter.
+ * Here nothing ever acts unconditionally on a shared name. Every mutation is
+ * one of three operations that the filesystem itself refuses when the
+ * situation has changed since we looked:
  *
- * Releasing checks the file carries this acquisition's own token, so a run
- * can never remove a lock that a later run has since taken over.
+ * - Taking the lock is `rename()` of a staging directory, already holding
+ *   our owner file, onto `.lock`. The rename succeeds only if `.lock` is
+ *   absent or an empty directory, and a held lock is never empty: owners
+ *   arrive populated, by this very rename.
+ * - Recovering a stale lock is `unlink()` of the owner file we read, by its
+ *   unique name. If anyone recovered it before us, that name is gone and the
+ *   unlink fails; we look again and find the new owner instead. A fresh
+ *   owner's file has a different name, so a delayed contender cannot remove
+ *   it by mistake.
+ * - Then `rmdir()` of `.lock`, which fails unless the directory is empty —
+ *   so it can never remove a lock that a new owner has since renamed into
+ *   place.
+ *
+ * Releasing is the same unlink-then-rmdir on our own file, and cannot touch a
+ * successor's for the same reasons.
  *
  * Deciding whether an owner is stale reuses the profile lock's reasoning: a
  * dead pid is stale, a live pid whose command line clearly belongs to
@@ -41,32 +51,18 @@ import { isProcessAlive, readProcessCommandLine } from './browser-profile-lock'
  * writers are not.
  */
 
-const LOCK_FILE = '.lock'
+const LOCK_DIR = '.lock'
 
 /**
- * How many times to go round the take-or-take-over loop before giving up.
+ * Passes round the take-or-recover loop before giving up.
  *
  * Each pass either takes the lock, throws because someone live holds it, or
- * finds the lock vanished between looking and acting — which only a release
- * in that instant can cause.
+ * loses a race with another contender at one of the conditional steps — and
+ * losing means that contender now holds the lock, so the next pass throws.
+ * Extra passes only cover a contender that took and released the lock within
+ * the same instant.
  */
-const ACQUIRE_ATTEMPTS = 5
-
-/**
- * How long to keep trying for the takeover directory before reporting the
- * book busy. It is held for the length of one `ps` call, so anything past a
- * few seconds is a holder that has hung, and waiting on it further helps no
- * one.
- */
-const TAKEOVER_WAIT_MS = 5000
-const TAKEOVER_POLL_MS = 25
-
-/**
- * A takeover directory older than this whose holder is gone was left behind
- * by a process that died mid-takeover. The age guard is belt and braces for
- * the case where the holder's pid could not be recorded or read.
- */
-const TAKEOVER_STALE_MS = 30_000
+const ACQUIRE_ATTEMPTS = 8
 
 export const BOOK_BUSY_CODE = 'BOOK_BUSY'
 
@@ -95,7 +91,7 @@ export function isBookBusyError(err: unknown): err is BookBusyError {
 
 interface BookLockOwner {
   pid: number
-  /** Unique to one acquisition, so release can tell its own lock from a successor's. */
+  /** Unique to one acquisition; also part of the owner file's name. */
   token: string
   startedAt: string
   command?: string
@@ -124,12 +120,12 @@ export function ownerLooksLive(commandLine: string | undefined): boolean {
 }
 
 export function bookLockPath(bookDir: string): string {
-  return path.join(bookDir, LOCK_FILE)
+  return path.join(bookDir, LOCK_DIR)
 }
 
-/** The directory whose existence means "someone is inspecting the lock". */
-export function takeoverPath(bookDir: string): string {
-  return `${bookLockPath(bookDir)}.takeover`
+/** The owner file's name, unique to one acquisition. */
+export function ownerFileName(owner: Pick<BookLockOwner, 'pid' | 'token'>) {
+  return `owner-${owner.pid}-${owner.token}.json`
 }
 
 function errorCode(err: unknown): string | undefined {
@@ -139,7 +135,7 @@ function errorCode(err: unknown): string | undefined {
 /**
  * Take the book's lock, run `fn`, and release it — including when `fn` throws.
  *
- * A stale lock is taken over; a live one raises `BookBusyError`, which callers
+ * A stale lock is recovered; a live one raises `BookBusyError`, which callers
  * present as an ordinary "try again later".
  */
 export async function withBookLock<T>(
@@ -152,7 +148,6 @@ export async function withBookLock<T>(
   }: BookLockOptions = {}
 ): Promise<T> {
   await fs.mkdir(bookDir, { recursive: true })
-  const lockPath = bookLockPath(bookDir)
   const owner: BookLockOwner = {
     pid: process.pid,
     token: randomUUID(),
@@ -165,7 +160,7 @@ export async function withBookLock<T>(
   try {
     return await fn()
   } finally {
-    await release(lockPath, owner)
+    await release(bookDir, owner)
   }
 }
 
@@ -174,179 +169,157 @@ async function acquire(
   owner: BookLockOwner,
   probes: Probes
 ): Promise<void> {
-  const lockPath = bookLockPath(bookDir)
+  const lockDir = bookLockPath(bookDir)
+  let lastSeen: BookLockOwner | undefined
 
   for (let attempt = 0; attempt < ACQUIRE_ATTEMPTS; attempt++) {
-    // The common case: nobody holds the book, and no inspection is needed.
-    if (await tryLink(lockPath, owner)) return
+    if (await tryTake(bookDir, owner)) return
 
-    const outcome = await withTakeoverRight(bookDir, probes, async () => {
-      // Read under the takeover right, so what we act on is what is there.
-      const existing = await readOwner(lockPath)
-      if (existing === 'missing') return 'vanished'
+    // Something holds the name. Look at it, and act only through steps that
+    // fail if it has changed since.
+    const seen = await inspect(lockDir)
 
-      if (
-        existing !== 'unreadable' &&
-        probes.isAlive(existing.pid) &&
-        ownerLooksLive(
-          await probes.commandLine(existing.pid).catch(() => undefined)
-        )
-      ) {
-        throw new BookBusyError(existing.pid, bookDir, existing.command)
-      }
+    if (seen.kind === 'missing') continue
 
-      // Stale: left by a run that died, by a pid that now belongs to
-      // something else, or a file that isn't ours to interpret. Nobody else
-      // can have replaced it since we read it, so moving it aside and linking
-      // our own record in its place is safe.
-      const aside = `${lockPath}.stale.${owner.token}`
-      try {
-        await fs.rename(lockPath, aside)
-      } catch (err) {
-        if (errorCode(err) !== 'ENOENT') throw err
-        return 'vanished'
-      }
-      await fs.rm(aside, { force: true }).catch(() => {})
-
-      return (await tryLink(lockPath, owner)) ? 'acquired' : 'vanished'
-    })
-
-    if (outcome === 'acquired') return
-    // 'vanished': the lock went away between two of our own steps, which only
-    // a release in that instant explains. Try again from the top.
-  }
-
-  throw new Error(
-    `could not take the lock on ${bookDir}: other runs kept taking it first`
-  )
-}
-
-/**
- * Run `fn` as the only process allowed to inspect and replace the book's lock.
- *
- * `mkdir()` either creates the directory or fails because it exists; there is
- * no third outcome, which is what makes it a mutex. A holder that died leaves
- * the directory behind, so a holder whose recorded pid is gone (or, failing a
- * readable pid, a directory older than `TAKEOVER_STALE_MS`) is cleared. A
- * holder that is alive but slow — `ps` hanging — is waited for briefly and
- * then reported as busy: nothing about a slow inspection makes it safe to
- * inspect concurrently.
- */
-async function withTakeoverRight<T>(
-  bookDir: string,
-  { isAlive }: Probes,
-  fn: () => Promise<T>
-): Promise<T> {
-  const dir = takeoverPath(bookDir)
-  const deadline = Date.now() + TAKEOVER_WAIT_MS
-
-  for (;;) {
-    try {
-      await fs.mkdir(dir)
-      break
-    } catch (err) {
-      if (errorCode(err) !== 'EEXIST') throw err
-    }
-
-    const holder = await readTakeoverHolder()
-    if (holder === 'stale') {
-      // Its owner died mid-inspection. Clearing it is itself a race between
-      // contenders, but a harmless one: whoever creates the directory next
-      // is the one whose inspection counts.
-      await fs.rm(dir, { recursive: true, force: true }).catch(() => {})
+    if (seen.kind === 'file') {
+      // A lock written by an earlier version of this module, which was a
+      // plain file. Its owner is judged the same way; unlink() of a plain
+      // file cannot touch a directory, so a fresh owner is safe from it.
+      await judge(seen.owner, bookDir, probes)
+      await fs.unlink(lockDir).catch(() => {})
       continue
     }
 
-    if (Date.now() > deadline) {
-      throw new BookBusyError(holder === 'unknown' ? 0 : holder, bookDir)
+    if (seen.kind === 'empty') {
+      // An owner mid-release, or mid-recovery. rmdir() only succeeds while it
+      // is still empty; if a new owner renamed into place first, it fails.
+      await fs.rmdir(lockDir).catch(() => {})
+      continue
     }
-    await new Promise((resolve) => setTimeout(resolve, TAKEOVER_POLL_MS))
+
+    await judge(seen.owner, bookDir, probes)
+    lastSeen = seen.owner ?? lastSeen
+
+    // Stale. Remove the owner file we read, by the name we read. Gone already
+    // means someone else recovered it — and may be the owner now.
+    try {
+      await fs.unlink(path.join(lockDir, seen.name))
+    } catch (err) {
+      if (errorCode(err) !== 'ENOENT') throw err
+      continue
+    }
+    // Only an empty directory comes off; a directory a new owner has since
+    // renamed in is populated and stays.
+    await fs.rmdir(lockDir).catch(() => {})
   }
 
-  try {
-    // Best effort, for the staleness check above; the directory itself is
-    // the lock.
-    await fs.writeFile(path.join(dir, 'pid'), `${process.pid}`).catch(() => {})
-    return await fn()
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true }).catch(() => {})
-  }
+  // Every pass lost a race to another contender. That is a busy book, even
+  // if no single owner held it long enough to be named.
+  throw new BookBusyError(lastSeen?.pid ?? 0, bookDir, lastSeen?.command)
+}
 
-  /** The holder's pid, `'stale'` if it is gone, `'unknown'` if unreadable. */
-  async function readTakeoverHolder(): Promise<number | 'stale' | 'unknown'> {
-    const pidText = await fs
-      .readFile(path.join(dir, 'pid'), 'utf8')
-      .catch(() => undefined)
-    const pid = pidText === undefined ? undefined : Number.parseInt(pidText, 10)
+/** Throw if `owner` is a live kindle-export run; return if it is stale. */
+async function judge(
+  owner: BookLockOwner | undefined,
+  bookDir: string,
+  { isAlive, commandLine }: Probes
+): Promise<void> {
+  if (!owner) return
 
-    if (pid !== undefined && Number.isInteger(pid) && pid > 0) {
-      return isAlive(pid) ? pid : 'stale'
-    }
-
-    // The pid file is written just after mkdir; not finding it means either
-    // that instant or a holder that died in it. Age tells the two apart.
-    const created = await fs
-      .stat(dir)
-      .then((stat) => stat.mtimeMs)
-      .catch(() => undefined)
-    if (created !== undefined && Date.now() - created > TAKEOVER_STALE_MS) {
-      return 'stale'
-    }
-
-    return 'unknown'
+  if (
+    isAlive(owner.pid) &&
+    ownerLooksLive(await commandLine(owner.pid).catch(() => undefined))
+  ) {
+    throw new BookBusyError(owner.pid, bookDir, owner.command)
   }
 }
 
 /**
- * Create the lock with the owner record already in it, or learn that the name
- * is taken. `link()` is the atomic step: unlike `writeFile` with `wx`, there is
- * no moment where the lock exists but is empty.
+ * Rename a staging directory that already holds our owner file onto `.lock`.
+ *
+ * `rename()` of a directory onto an existing directory succeeds only if that
+ * directory is empty, and fails otherwise — which is exactly "take the lock
+ * unless someone holds it", decided by the filesystem in one step.
  */
-async function tryLink(
-  lockPath: string,
+async function tryTake(
+  bookDir: string,
   owner: BookLockOwner
 ): Promise<boolean> {
-  const temp = `${lockPath}.${owner.token}.tmp`
-  await fs.writeFile(temp, JSON.stringify(owner, null, 2))
+  const lockDir = bookLockPath(bookDir)
+  const staging = path.join(bookDir, `${LOCK_DIR}.staging.${owner.token}`)
+
+  await fs.mkdir(staging)
+  await fs.writeFile(
+    path.join(staging, ownerFileName(owner)),
+    JSON.stringify(owner, null, 2)
+  )
 
   try {
-    await fs.link(temp, lockPath)
+    await fs.rename(staging, lockDir)
     return true
   } catch (err) {
-    if (errorCode(err) !== 'EEXIST') throw err
+    // ENOTEMPTY and EEXIST: a populated lock is there. ENOTDIR: an old-style
+    // lock file is there. All mean "held", and inspect() sorts them out.
+    if (!['ENOTEMPTY', 'EEXIST', 'ENOTDIR'].includes(errorCode(err) ?? '')) {
+      throw err
+    }
+    await fs.rm(staging, { recursive: true, force: true }).catch(() => {})
     return false
-  } finally {
-    await fs.rm(temp, { force: true }).catch(() => {})
   }
 }
 
-async function release(lockPath: string, owner: BookLockOwner): Promise<void> {
-  // Only this acquisition's own lock comes off. Anything else in its place —
-  // a later run that took it over as stale — is that run's, and removing it
-  // would reintroduce the race this exists to prevent.
-  const current = await readOwner(lockPath)
-  if (typeof current === 'object' && current.token === owner.token) {
-    await fs.rm(lockPath, { force: true }).catch(() => {})
-  }
-}
+type Inspection =
+  | { kind: 'missing' }
+  | { kind: 'empty' }
+  | { kind: 'file'; owner: BookLockOwner | undefined }
+  | { kind: 'owned'; name: string; owner: BookLockOwner | undefined }
 
-async function readOwner(
-  lockPath: string
-): Promise<BookLockOwner | 'missing' | 'unreadable'> {
-  let raw: string
+/** What occupies the lock name right now. */
+async function inspect(lockDir: string): Promise<Inspection> {
+  let entries: string[]
   try {
-    raw = await fs.readFile(lockPath, 'utf8')
+    entries = await fs.readdir(lockDir)
   } catch (err) {
-    return errorCode(err) === 'ENOENT' ? 'missing' : 'unreadable'
+    if (errorCode(err) === 'ENOENT') return { kind: 'missing' }
+    if (errorCode(err) === 'ENOTDIR') {
+      return { kind: 'file', owner: await readOwner(lockDir) }
+    }
+    throw err
   }
 
+  if (entries.length === 0) return { kind: 'empty' }
+
+  // Exactly one owner file is the only shape this module writes. Anything
+  // else is treated as that entry being the owner: an unreadable owner is
+  // stale, and the recovery below still removes only the names it saw.
+  const name =
+    entries.find((entry) => entry.startsWith('owner-')) ?? entries[0]!
+
+  return {
+    kind: 'owned',
+    name,
+    owner: await readOwner(path.join(lockDir, name))
+  }
+}
+
+async function release(bookDir: string, owner: BookLockOwner): Promise<void> {
+  const lockDir = bookLockPath(bookDir)
+  // Our own file by its unique name, then the directory only if that left it
+  // empty. Neither step can touch a successor's lock.
+  await fs.unlink(path.join(lockDir, ownerFileName(owner))).catch(() => {})
+  await fs.rmdir(lockDir).catch(() => {})
+}
+
+/** The owner record in a file, or undefined if it is not one. */
+async function readOwner(file: string): Promise<BookLockOwner | undefined> {
   try {
-    const parsed = JSON.parse(raw) as Partial<BookLockOwner> | null
-    if (typeof parsed?.pid !== 'number' || parsed.pid <= 0) return 'unreadable'
-    if (typeof parsed.token !== 'string') return 'unreadable'
+    const parsed = JSON.parse(
+      await fs.readFile(file, 'utf8')
+    ) as Partial<BookLockOwner> | null
+    if (typeof parsed?.pid !== 'number' || parsed.pid <= 0) return
 
     return parsed as BookLockOwner
   } catch {
-    return 'unreadable'
+    return
   }
 }

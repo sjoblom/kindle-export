@@ -33,15 +33,25 @@ export type CaptureAction =
 export const NAVIGATION_ATTEMPTS = 5
 
 /**
- * Turn attempts spent confirming the end of the book.
+ * Consecutive sightings of "no next page" it takes to believe the book ended.
  *
  * Two, because the one positive sign of an ending — the chevron being gone —
  * is also what the reader looks like for a moment mid-render. Seeing it gone
- * twice, a few seconds apart, is the confirmation; seeing it once is not. The
- * cost is a few seconds on every finished capture, which is the price of not
+ * twice in a row, a few seconds apart, is the confirmation; seeing it once
+ * is not, and a usable chevron in between starts the count again. The cost is
+ * a few seconds on every finished capture, which is the price of not
  * declaring a book complete on a hunch.
  */
 export const END_CONFIRMATION_ATTEMPTS = 2
+
+/**
+ * Turn attempts allowed on the last numbered page before giving up on it.
+ *
+ * One more than the confirmation needs, so a single stalled render before the
+ * chevron disappears doesn't cost the confirmation its chance. Anything that
+ * hasn't confirmed itself by then is recorded as unconfirmed, not finished.
+ */
+export const END_CONFIRMATION_MAX_ATTEMPTS = END_CONFIRMATION_ATTEMPTS + 1
 
 /** How long a normal page turn is given to render a new image. */
 export const NAVIGATION_TIMEOUT_MS = 10_000
@@ -94,7 +104,9 @@ export function isOnLastNumberedPage({
 
 /** Attempts to allow for one screen. */
 export function maxNavigationAttempts(onLastNumberedPage: boolean): number {
-  return onLastNumberedPage ? END_CONFIRMATION_ATTEMPTS : NAVIGATION_ATTEMPTS
+  return onLastNumberedPage
+    ? END_CONFIRMATION_MAX_ATTEMPTS
+    : NAVIGATION_ATTEMPTS
 }
 
 /** How long to spend on the chevron click itself. */
@@ -155,14 +167,27 @@ export function shouldStopBeforeCapture({
 }
 
 export interface NavigationAttemptInput {
-  /** What the turn attempt produced. */
-  navigation: NavigationResult
+  /**
+   * What every turn attempt on this screen produced so far, oldest first.
+   * The whole history, not just the latest: the end of a book is a pattern
+   * of observations, and one sighting proves nothing on its own.
+   */
+  observations: NavigationResult[]
   /** Whether the footer reported the book's last page for this screen. */
   onLastNumberedPage: boolean
-  /** 1-based count of turn attempts made for this screen. */
-  attempt: number
   /** Attempts allowed for this screen, from `maxNavigationAttempts`. */
   maxAttempts: number
+}
+
+/** How many of the latest observations in a row found no next page. */
+function trailingAbsences(observations: NavigationResult[]): number {
+  let count = 0
+  for (let i = observations.length - 1; i >= 0; i--) {
+    if (observations[i] !== 'no-next-page') break
+    count++
+  }
+
+  return count
 }
 
 /**
@@ -173,32 +198,38 @@ export interface NavigationAttemptInput {
  * normally, and each of those screens gets captured.
  *
  * Only one thing marks a capture complete: the reader offering no next page,
- * seen on every attempt this screen was given. A reader that still shows a
- * usable next-page control and won't turn to it is a reader that has stopped
- * responding, wherever the footer says we are — the footer counts pages, not
- * screens, so it cannot vouch for the screens after this one. That case is
- * recorded as incomplete, and the person can capture again, rather than as a
- * finished book that is quietly short.
+ * seen `END_CONFIRMATION_ATTEMPTS` times in a row, with no usable control
+ * sighted in between. The reader drops the chevron for a moment mid-render,
+ * so one absence — even as the final attempt of the budget — is not an
+ * ending, and an absence followed by a usable control was the render, not
+ * the end. Mid-book, where the footer gives no reason to expect an ending,
+ * the run-out of the whole budget is required as well.
+ *
+ * A reader that still shows a usable next-page control and won't turn to it
+ * is a reader that has stopped responding, wherever the footer says we are —
+ * the footer counts pages, not screens, so it cannot vouch for the screens
+ * after this one. That case is recorded as incomplete, and the person can
+ * capture again, rather than as a finished book that is quietly short.
  */
 export function shouldStopCapture({
-  navigation,
+  observations,
   onLastNumberedPage,
-  attempt,
   maxAttempts
 }: NavigationAttemptInput): CaptureAction {
-  if (navigation === 'navigated') {
+  if (observations.at(-1) === 'navigated') {
     return { type: 'capture-next-screen' }
   }
 
-  if (attempt < maxAttempts) {
-    return { type: 'retry-navigation' }
+  const confirmedAbsent =
+    trailingAbsences(observations) >= END_CONFIRMATION_ATTEMPTS &&
+    (onLastNumberedPage || observations.length >= maxAttempts)
+
+  if (confirmedAbsent) {
+    return { type: 'stop', complete: true, reason: 'end-of-book' }
   }
 
-  // The reader removes the chevron when there's nowhere left to go, but it
-  // also drops it briefly mid-render — so a missing chevron only counts once
-  // it has stayed missing for every attempt.
-  if (navigation === 'no-next-page') {
-    return { type: 'stop', complete: true, reason: 'end-of-book' }
+  if (observations.length < maxAttempts) {
+    return { type: 'retry-navigation' }
   }
 
   return onLastNumberedPage

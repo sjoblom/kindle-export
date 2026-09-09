@@ -5,12 +5,14 @@ import {
   CLICK_FAILED_TIMEOUT_MS,
   END_CONFIRMATION_ATTEMPTS,
   END_CONFIRMATION_CLICK_TIMEOUT_MS,
+  END_CONFIRMATION_MAX_ATTEMPTS,
   END_CONFIRMATION_TIMEOUT_MS,
   isOnLastNumberedPage,
   maxNavigationAttempts,
   NAVIGATION_ATTEMPTS,
   NAVIGATION_CLICK_TIMEOUT_MS,
   NAVIGATION_TIMEOUT_MS,
+  type NavigationResult,
   navigationTimeoutMs,
   shouldStopBeforeCapture,
   shouldStopCapture
@@ -35,130 +37,137 @@ describe('isOnLastNumberedPage', () => {
 describe('shouldStopCapture: a last numbered page spanning several screens', () => {
   const onLastNumberedPage = true
   const maxAttempts = maxNavigationAttempts(onLastNumberedPage)
+  const decide = (observations: NavigationResult[]) =>
+    shouldStopCapture({ observations, onLastNumberedPage, maxAttempts })
 
   it('keeps capturing while the reader still turns the page', () => {
     // The regression this exists for: page 145 of 145 covers three screens.
     // The footer reads "145 of 145" on all three, and stopping on the first
     // one silently dropped two screens while claiming the book was complete.
-    for (const attempt of [1, 2, 3]) {
-      expect(
-        shouldStopCapture({
-          navigation: 'navigated',
-          onLastNumberedPage,
-          attempt,
-          maxAttempts
-        })
-      ).toEqual({ type: 'capture-next-screen' })
-    }
+    expect(decide(['navigated'])).toEqual({ type: 'capture-next-screen' })
+    expect(decide(['stalled', 'navigated'])).toEqual({
+      type: 'capture-next-screen'
+    })
   })
 
   it('declares the end only once the chevron has stayed gone', () => {
     // The chevron vanishes briefly mid-render too, so one sighting is a hint
     // and the second, a few seconds later, is the confirmation.
-    expect(
-      shouldStopCapture({
-        navigation: 'no-next-page',
-        onLastNumberedPage,
-        attempt: 1,
-        maxAttempts
-      })
-    ).toEqual({ type: 'retry-navigation' })
+    expect(decide(['no-next-page'])).toEqual({ type: 'retry-navigation' })
+    expect(decide(['no-next-page', 'no-next-page'])).toEqual({
+      type: 'stop',
+      complete: true,
+      reason: 'end-of-book'
+    })
+  })
 
-    expect(
-      shouldStopCapture({
-        navigation: 'no-next-page',
-        onLastNumberedPage,
-        attempt: maxAttempts,
-        maxAttempts
-      })
-    ).toEqual({ type: 'stop', complete: true, reason: 'end-of-book' })
+  it('still confirms an end that a single stalled render preceded', () => {
+    expect(decide(['stalled', 'no-next-page'])).toEqual({
+      type: 'retry-navigation'
+    })
+    expect(decide(['stalled', 'no-next-page', 'no-next-page'])).toEqual({
+      type: 'stop',
+      complete: true,
+      reason: 'end-of-book'
+    })
+  })
+
+  it('does not count an absence that a usable chevron interrupted', () => {
+    // Gone, back, gone: the first absence was the render, so the last one is
+    // a single sighting again — and the budget is spent.
+    expect(decide(['no-next-page', 'stalled', 'no-next-page'])).toEqual({
+      type: 'stop',
+      complete: false,
+      reason: 'end-unconfirmed'
+    })
   })
 
   it('never calls a stalled reader on the final page a finished book', () => {
-    expect(
-      shouldStopCapture({
-        navigation: 'stalled',
-        onLastNumberedPage,
-        attempt: 1,
-        maxAttempts
-      })
-    ).toEqual({ type: 'retry-navigation' })
+    expect(decide(['stalled'])).toEqual({ type: 'retry-navigation' })
+    expect(decide(['stalled', 'stalled'])).toEqual({
+      type: 'retry-navigation'
+    })
 
     // A usable next-page control is still on screen and the reader would not
     // turn to it. The footer counts pages, not screens, so it cannot say the
     // screens after this one don't exist; the honest record is "unconfirmed",
     // which the person can resolve by capturing again.
-    expect(
-      shouldStopCapture({
-        navigation: 'stalled',
-        onLastNumberedPage,
-        attempt: maxAttempts,
-        maxAttempts
-      })
-    ).toEqual({ type: 'stop', complete: false, reason: 'end-unconfirmed' })
+    expect(decide(['stalled', 'stalled', 'stalled'])).toEqual({
+      type: 'stop',
+      complete: false,
+      reason: 'end-unconfirmed'
+    })
+    // The single absence at the very end is one sighting, not a confirmation.
+    expect(decide(['stalled', 'stalled', 'no-next-page'])).toEqual({
+      type: 'stop',
+      complete: false,
+      reason: 'end-unconfirmed'
+    })
+    expect(decide(['stalled', 'no-next-page', 'stalled'])).toEqual({
+      type: 'stop',
+      complete: false,
+      reason: 'end-unconfirmed'
+    })
   })
 })
+
+const stalls = (n: number): NavigationResult[] =>
+  Array.from({ length: n }, () => 'stalled')
 
 describe('shouldStopCapture: mid-book', () => {
   const onLastNumberedPage = false
   const maxAttempts = maxNavigationAttempts(onLastNumberedPage)
+  const decide = (observations: NavigationResult[]) =>
+    shouldStopCapture({ observations, onLastNumberedPage, maxAttempts })
 
   it('retries a stalled turn until the attempts run out', () => {
     for (let attempt = 1; attempt < maxAttempts; attempt++) {
-      expect(
-        shouldStopCapture({
-          navigation: 'stalled',
-          onLastNumberedPage,
-          attempt,
-          maxAttempts
-        })
-      ).toEqual({ type: 'retry-navigation' })
+      expect(decide(stalls(attempt))).toEqual({ type: 'retry-navigation' })
     }
 
-    expect(
-      shouldStopCapture({
-        navigation: 'stalled',
-        onLastNumberedPage,
-        attempt: maxAttempts,
-        maxAttempts
-      })
-    ).toEqual({ type: 'stop', complete: false, reason: 'navigation-failed' })
+    expect(decide(stalls(maxAttempts))).toEqual({
+      type: 'stop',
+      complete: false,
+      reason: 'navigation-failed'
+    })
   })
 
   it('retries a briefly missing chevron rather than calling it the end', () => {
     // Kindle drops the chevron mid-render. Believing it the first time would
     // mark a book complete in the middle of a chapter.
-    expect(
-      shouldStopCapture({
-        navigation: 'no-next-page',
-        onLastNumberedPage,
-        attempt: 1,
-        maxAttempts
-      })
-    ).toEqual({ type: 'retry-navigation' })
+    expect(decide(['no-next-page'])).toEqual({ type: 'retry-navigation' })
+    expect(decide(['no-next-page', 'no-next-page'])).toEqual({
+      type: 'retry-navigation'
+    })
   })
 
-  it('accepts a chevron that is still missing after every attempt', () => {
+  it('accepts a chevron that has stayed missing through the last attempts', () => {
     // Books whose footer never reports the final page end here instead.
     expect(
-      shouldStopCapture({
-        navigation: 'no-next-page',
-        onLastNumberedPage,
-        attempt: maxAttempts,
-        maxAttempts
-      })
+      decide([...stalls(maxAttempts - 2), 'no-next-page', 'no-next-page'])
     ).toEqual({ type: 'stop', complete: true, reason: 'end-of-book' })
   })
 
-  it('carries on as soon as a turn lands', () => {
+  it('does not accept a chevron missing only on the final attempt', () => {
+    expect(decide([...stalls(maxAttempts - 1), 'no-next-page'])).toEqual({
+      type: 'stop',
+      complete: false,
+      reason: 'navigation-failed'
+    })
     expect(
-      shouldStopCapture({
-        navigation: 'navigated',
-        onLastNumberedPage,
-        attempt: 3,
-        maxAttempts
-      })
-    ).toEqual({ type: 'capture-next-screen' })
+      decide([
+        ...stalls(maxAttempts - 3),
+        'no-next-page',
+        'stalled',
+        'no-next-page'
+      ])
+    ).toEqual({ type: 'stop', complete: false, reason: 'navigation-failed' })
+  })
+
+  it('carries on as soon as a turn lands', () => {
+    expect(decide([...stalls(2), 'navigated'])).toEqual({
+      type: 'capture-next-screen'
+    })
   })
 })
 
@@ -211,10 +220,16 @@ describe('shouldStopBeforeCapture', () => {
 })
 
 describe('navigation budgets', () => {
-  it('spends a couple of short attempts confirming the end of the book', () => {
+  it('spends a few short attempts confirming the end of the book', () => {
     // (b) of the fix: a finished book must not cost 5 × 10s to notice.
-    expect(maxNavigationAttempts(true)).toBe(END_CONFIRMATION_ATTEMPTS)
-    expect(END_CONFIRMATION_ATTEMPTS).toBeLessThan(NAVIGATION_ATTEMPTS)
+    expect(maxNavigationAttempts(true)).toBe(END_CONFIRMATION_MAX_ATTEMPTS)
+    expect(END_CONFIRMATION_MAX_ATTEMPTS).toBeLessThan(NAVIGATION_ATTEMPTS)
+    // ...but a confirmation needs more than one sighting, and the budget has
+    // to leave room for it.
+    expect(END_CONFIRMATION_ATTEMPTS).toBeGreaterThan(1)
+    expect(END_CONFIRMATION_MAX_ATTEMPTS).toBeGreaterThan(
+      END_CONFIRMATION_ATTEMPTS
+    )
     expect(
       navigationTimeoutMs({ onLastNumberedPage: true, clickFailed: false })
     ).toBe(END_CONFIRMATION_TIMEOUT_MS)

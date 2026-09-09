@@ -30,6 +30,7 @@ import {
   chevronClickTimeoutMs,
   isOnLastNumberedPage,
   maxNavigationAttempts,
+  type NavigationResult,
   navigationTimeoutMs,
   shouldStopBeforeCapture,
   shouldStopCapture
@@ -1301,8 +1302,11 @@ export async function extractBook(
         total: pageNav.total
       })
       const maxAttempts = maxNavigationAttempts(onLastNumberedPage)
+      // Every attempt's outcome for this screen: the decision needs the run
+      // of them, not the latest one.
+      const observations: NavigationResult[] = []
 
-      for (let attempt = 1; ; attempt++) {
+      for (;;) {
         // This delay seems to help speed up the navigation process, possibly due
         // to the navigation chevron needing time to settle.
         await delay(100)
@@ -1354,14 +1358,16 @@ export async function extractBook(
           ]
         )
 
-        const action = shouldStopCapture({
-          navigation: navigatedToNextPage
+        observations.push(
+          navigatedToNextPage
             ? 'navigated'
             : (await hasUsableNextPageChevron())
               ? 'stalled'
-              : 'no-next-page',
+              : 'no-next-page'
+        )
+        const action = shouldStopCapture({
+          observations,
           onLastNumberedPage,
-          attempt,
           maxAttempts
         })
 

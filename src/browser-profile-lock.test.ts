@@ -82,6 +82,29 @@ describe('commandLineOwnsProfile', () => {
     ).toBe(false)
   })
 
+  it('matches a profile path with spaces, which ps prints unquoted', () => {
+    // `ps -o command=` joins the arguments with spaces and adds no quotes, so
+    // the path runs straight into the flags after it. Cutting it at the first
+    // space called a live browser stale and deleted its lock.
+    const spaced = '/Users/emil/Library/Kindle Export/profile'
+    expect(
+      commandLineOwnsProfile(
+        `chrome --user-data-dir=${spaced} --hide-crash-restore-bubble`,
+        spaced
+      )
+    ).toBe(true)
+    expect(
+      commandLineOwnsProfile(`chrome --user-data-dir=${spaced}`, spaced)
+    ).toBe(true)
+    // ...while a neighbour of that path is still not it.
+    expect(
+      commandLineOwnsProfile(
+        `chrome --user-data-dir=${spaced}-2 --hide-crash-restore-bubble`,
+        spaced
+      )
+    ).toBe(false)
+  })
+
   it('does not match an unrelated program that reused the pid', () => {
     expect(commandLineOwnsProfile('/usr/bin/vim notes.md', PROFILE_DIR)).toBe(
       false

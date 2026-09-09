@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 
 import { checkbox, confirm, input, password } from '@inquirer/prompts'
 
+import { isBookBusyError, withBookLock } from './book-lock'
 import { bookCompleteness } from './capture-status'
 import { cleanPageImages, cleanRenderData, formatBytes } from './cleanup'
 import { loadConfig, saveConfig } from './config'
@@ -361,37 +362,53 @@ async function clean(options: Options): Promise<void> {
 
   let freed = 0
   for (const asin of asins) {
-    const render = await cleanRenderData(options.outDir, asin)
-    freed += render.freed
+    // Under the same per-book lock as a run, because what this deletes is a
+    // run's input: a transcription in progress still needs its page images,
+    // and a capture in progress is still reading its render data.
+    try {
+      freed += await withBookLock(
+        path.join(options.outDir, asin),
+        () => cleanBook(asin, options),
+        { command: 'clean' }
+      )
+    } catch (err) {
+      if (!isBookBusyError(err)) throw err
 
-    // Page images only go when every captured page has text, otherwise a retry
-    // silently becomes a re-capture. This is the same question the transcribe
-    // stage asks before deleting them, asked the same way.
-    let pages = { freed: 0, removed: [] as string[] }
-    if (!options.keepPages) {
-      const metadata = await readMetadata(options.outDir, asin)
-      const completeness = bookCompleteness({
-        metadata,
-        content: await readContentStore(path.join(options.outDir, asin)),
-        asin
-      })
-
-      if (completeness.capturedPages && !completeness.missingPages.length) {
-        pages = await cleanPageImages(options.outDir, asin)
-      } else if (completeness.transcribedPages) {
-        console.log(
-          `[${asin}] keeping page images: transcription is incomplete`
-        )
-      }
-    }
-
-    freed += pages.freed
-    if (render.freed || pages.freed) {
-      console.log(`[${asin}] freed ${formatBytes(render.freed + pages.freed)}`)
+      console.log(`[${asin}] skipped: ${err.message}`)
     }
   }
 
   console.log(`\nFreed ${formatBytes(freed)} in total.`)
+}
+
+/** Free what one book no longer needs; returns the bytes freed. */
+async function cleanBook(asin: string, options: Options): Promise<number> {
+  const render = await cleanRenderData(options.outDir, asin)
+
+  // Page images only go when every captured page has text, otherwise a retry
+  // silently becomes a re-capture. This is the same question the transcribe
+  // stage asks before deleting them, asked the same way.
+  let pages = { freed: 0, removed: [] as string[] }
+  if (!options.keepPages) {
+    const metadata = await readMetadata(options.outDir, asin)
+    const completeness = bookCompleteness({
+      metadata,
+      content: await readContentStore(path.join(options.outDir, asin)),
+      asin
+    })
+
+    if (completeness.capturedPages && !completeness.missingPages.length) {
+      pages = await cleanPageImages(options.outDir, asin)
+    } else if (completeness.transcribedPages) {
+      console.log(`[${asin}] keeping page images: transcription is incomplete`)
+    }
+  }
+
+  if (render.freed || pages.freed) {
+    console.log(`[${asin}] freed ${formatBytes(render.freed + pages.freed)}`)
+  }
+
+  return render.freed + pages.freed
 }
 
 async function listBookDirs(outDir: string): Promise<string[]> {

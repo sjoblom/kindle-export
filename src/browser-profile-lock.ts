@@ -109,10 +109,18 @@ export function parseLockPid(linkTarget: string): number | undefined {
  * Whether a process's command line shows it running against this profile.
  *
  * Chrome is launched with `--user-data-dir=<profile>`, so that argument is the
- * direct answer. When it isn't there to compare against we fall back to "does
- * the profile path appear at all", and every ambiguity resolves towards "yes,
- * this is the owner": a false positive costs the user a clear error message,
- * while a false negative deletes the lock out from under a running browser.
+ * direct answer. `ps` prints the arguments joined by spaces with no quoting,
+ * which means a profile path containing a space — `~/Kindle Export/profile` —
+ * runs straight into the arguments after it. So the value is taken as
+ * everything to the end of the line and matched by prefix, with the profile
+ * path having to end exactly where a space (or the line) begins. That still
+ * tells `.browser-profile` from `.browser-profile-2`, which a substring match
+ * would not, without ever cutting a real path short at its first space.
+ *
+ * When the argument isn't there at all we fall back to "does the profile path
+ * appear anywhere", and every ambiguity resolves towards "yes, this is the
+ * owner": a false positive costs the user a clear error message, while a
+ * false negative deletes the lock out from under a running browser.
  */
 export function commandLineOwnsProfile(
   commandLine: string,
@@ -120,19 +128,25 @@ export function commandLineOwnsProfile(
 ): boolean {
   // The caller's `profileDir` may be relative ('out/.browser-profile') while
   // the command line shows an absolute path, or the other way around.
-  const candidates = [profileDir, path.resolve(profileDir)]
+  const candidates = [...new Set([profileDir, path.resolve(profileDir)])]
 
-  const userDataDir = commandLine.match(
-    /--user-data-dir[= ]("[^"]*"|'[^']*'|\S+)/
-  )?.[1]
+  const rest = commandLine.match(/--user-data-dir(?:=|\s+)(.*)$/s)?.[1]
 
-  if (userDataDir) {
-    const unquoted = userDataDir.replaceAll(/^["']|["']$/g, '')
-    // Compared as resolved paths so a profile named `.browser-profile` isn't
-    // mistaken for `.browser-profile-2`, which substring matching would do.
-    return candidates.some(
-      (candidate) => path.resolve(unquoted) === path.resolve(candidate)
-    )
+  if (rest !== undefined) {
+    // A shell-quoted value is unambiguous; `ps` never produces one, but a
+    // launcher that logs its own command line might.
+    const quoted = rest.match(/^"([^"]*)"|^'([^']*)'/)
+    const value = quoted ? (quoted[1] ?? quoted[2])! : rest
+
+    return candidates.some((candidate) => {
+      if (value === candidate) return true
+      if (!value.startsWith(candidate)) return false
+
+      const next = value[candidate.length]!
+      // The path ends here and the next argument begins — or this is the
+      // path itself with a trailing separator.
+      return /\s/.test(next) || next === path.sep
+    })
   }
 
   return candidates.some((candidate) => commandLine.includes(candidate))

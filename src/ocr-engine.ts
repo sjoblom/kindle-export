@@ -1,3 +1,5 @@
+import type { OcrLine } from './types'
+
 /**
  * Transcription is pure OCR — read the page verbatim, no interpretation. The
  * structure work (headings, rejoining paragraphs split across pages, matching
@@ -15,6 +17,18 @@ export interface OcrRequest {
   signal: AbortSignal
 }
 
+/** What an engine read off one page. */
+export interface OcrPageText {
+  /** The page's text, one newline per paragraph boundary. */
+  text: string
+  /**
+   * The rendered lines `text` was assembled from, for engines that see the
+   * page that way. Stored with the transcription so the assembly can be
+   * revisited without reading the page again.
+   */
+  lines?: OcrLine[]
+}
+
 export interface OcrEngine {
   /** Shown in progress output and errors, e.g. `Apple Vision` or `gpt-4.1-mini`. */
   readonly name: string
@@ -28,7 +42,7 @@ export interface OcrEngine {
    * from. An engine that sees the page as rendered lines has to put the
    * paragraphs back together itself (see `ocr-layout.ts`).
    */
-  recognize(request: OcrRequest): Promise<string>
+  recognize(request: OcrRequest): Promise<OcrPageText>
   /** Release any worker process. Safe to call more than once. */
   close(): Promise<void>
 }

@@ -52,7 +52,9 @@ describe('shouldStopCapture: a last numbered page spanning several screens', () 
     }
   })
 
-  it('declares the end once the reader refuses, on the first attempt', () => {
+  it('declares the end only once the chevron has stayed gone', () => {
+    // The chevron vanishes briefly mid-render too, so one sighting is a hint
+    // and the second, a few seconds later, is the confirmation.
     expect(
       shouldStopCapture({
         navigation: 'no-next-page',
@@ -60,13 +62,19 @@ describe('shouldStopCapture: a last numbered page spanning several screens', () 
         attempt: 1,
         maxAttempts
       })
+    ).toEqual({ type: 'retry-navigation' })
+
+    expect(
+      shouldStopCapture({
+        navigation: 'no-next-page',
+        onLastNumberedPage,
+        attempt: maxAttempts,
+        maxAttempts
+      })
     ).toEqual({ type: 'stop', complete: true, reason: 'end-of-book' })
   })
 
-  it('gives a stalled turn on the final page one more try before calling it the end', () => {
-    // Some books keep a live chevron on the last screen. A stall there is
-    // usually the end, but it is also what a slow render of one more screen
-    // looks like, and a second short attempt is cheaper than losing it.
+  it('never calls a stalled reader on the final page a finished book', () => {
     expect(
       shouldStopCapture({
         navigation: 'stalled',
@@ -76,8 +84,10 @@ describe('shouldStopCapture: a last numbered page spanning several screens', () 
       })
     ).toEqual({ type: 'retry-navigation' })
 
-    // The footer says there is no page after this one and the reader produced
-    // nothing twice, so this is a finished book rather than a truncated capture.
+    // A usable next-page control is still on screen and the reader would not
+    // turn to it. The footer counts pages, not screens, so it cannot say the
+    // screens after this one don't exist; the honest record is "unconfirmed",
+    // which the person can resolve by capturing again.
     expect(
       shouldStopCapture({
         navigation: 'stalled',
@@ -85,7 +95,7 @@ describe('shouldStopCapture: a last numbered page spanning several screens', () 
         attempt: maxAttempts,
         maxAttempts
       })
-    ).toEqual({ type: 'stop', complete: true, reason: 'end-of-book' })
+    ).toEqual({ type: 'stop', complete: false, reason: 'end-unconfirmed' })
   })
 })
 

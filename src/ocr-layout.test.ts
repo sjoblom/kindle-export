@@ -144,7 +144,7 @@ describe('reconstructParagraphs', () => {
     )
   })
 
-  it('rejoins a word broken across lines by a soft hyphen', () => {
+  it('keeps a line-ending hyphen, since a soft break and a compound look alike', () => {
     const text = reconstructParagraphs(
       page([
         ['Nobody wants to read some-'],
@@ -152,7 +152,9 @@ describe('reconstructParagraphs', () => {
       ])
     )
 
-    expect(text).toBe('Nobody wants to read something that has been broken')
+    // Not ideal for a soft break — but the alternative merged `self-esteem`
+    // into `selfesteem`, and the raw lines are stored for a better rule later.
+    expect(text).toBe('Nobody wants to read some-thing that has been broken')
   })
 
   it('leaves the hyphen alone when it is part of the word', () => {
@@ -179,6 +181,16 @@ describe('joinWrappedLines', () => {
   it('keeps a hyphen after a short prefix, which is rarely a soft break', () => {
     expect(joinWrappedLines('sent by e-', 'mail today')).toBe(
       'sent by e-mail today'
+    )
+  })
+
+  it('keeps the hyphen of an ordinary lowercase compound', () => {
+    expect(joinWrappedLines('her self-', 'esteem grew')).toBe(
+      'her self-esteem grew'
+    )
+    expect(joinWrappedLines('a well-', 'known fact')).toBe('a well-known fact')
+    expect(joinWrappedLines('the state-of-the-', 'art model')).toBe(
+      'the state-of-the-art model'
     )
   })
 

@@ -394,7 +394,7 @@ describe('transcribeBook', () => {
       name: 'fake',
       costsMoney: false,
       async recognize({ imagePath }) {
-        if (imagePath.endsWith('0.png')) return 'page one'
+        if (imagePath.endsWith('0.png')) return { text: 'page one' }
 
         // Stands in for a Ctrl+C: page two never comes back until the test has
         // looked at what page one left behind.

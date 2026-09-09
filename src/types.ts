@@ -46,6 +46,11 @@ export type CaptureStopReason =
   | 'past-last-content-page'
   /** The reader stopped advancing. */
   | 'navigation-failed'
+  /**
+   * The footer reported the last page but the reader still offered a next
+   * page and would not render it, so the final screens may be missing.
+   */
+  | 'end-unconfirmed'
   /** Page position became unreadable mid-book. */
   | 'no-page-nav'
   /** Metadata written mid-capture; the run never reached an end state. */
@@ -83,6 +88,26 @@ export interface ContentChunk {
   text: string
   /** As `PageChunk.screenshot` — relative to the book directory. */
   screenshot: string
+  /**
+   * What the engine actually saw, when it works in rendered lines: each line's
+   * text and where it sat on the page. `text` is derived from these, and the
+   * derivation makes judgment calls (which line breaks are paragraph breaks,
+   * how a line-ending hyphen joins). Keeping the raw lines means a better
+   * judgment later costs a re-export, not a re-capture or another OCR run.
+   */
+  lines?: OcrLine[]
+}
+
+/** One line of text as an OCR engine recognised it on the page image. */
+export interface OcrLine {
+  /** The recognised text of one rendered line. */
+  text: string
+  /** Pixels from the left edge of the page image. */
+  left: number
+  /** Pixels from the top edge of the page image. */
+  top: number
+  width: number
+  height: number
 }
 
 /**

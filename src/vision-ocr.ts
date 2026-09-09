@@ -3,7 +3,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import type { OcrEngine, OcrRequest } from './ocr-engine'
+import type { OcrEngine, OcrPageText, OcrRequest } from './ocr-engine'
 import { parseOcrLines, reconstructParagraphs } from './ocr-layout'
 
 /**
@@ -25,7 +25,7 @@ const SUPPORTED_PROTOCOL = 2
 const HANDSHAKE_TIMEOUT_MS = 10_000
 
 interface PendingRequest {
-  resolve: (text: string) => void
+  resolve: (result: OcrPageText) => void
   reject: (err: Error) => void
 }
 
@@ -60,11 +60,11 @@ export async function isVisionOcrAvailable(): Promise<boolean> {
  * only here so a stale binary degrades to over-split prose rather than to
  * nothing at all.
  */
-function pageText(message: any): string {
+function pageText(message: any): OcrPageText {
   const lines = parseOcrLines(message?.lines)
-  if (lines.length) return reconstructParagraphs(lines)
+  if (lines.length) return { text: reconstructParagraphs(lines), lines }
 
-  return typeof message?.text === 'string' ? message.text : ''
+  return { text: typeof message?.text === 'string' ? message.text : '' }
 }
 
 export function createVisionOcrEngine(
@@ -233,22 +233,22 @@ export function createVisionOcrEngine(
     name: 'Apple Vision',
     costsMoney: false,
 
-    async recognize({ imagePath, signal }: OcrRequest): Promise<string> {
+    async recognize({ imagePath, signal }: OcrRequest): Promise<OcrPageText> {
       if (closed) throw new Error('Vision OCR engine is closed')
 
       const proc = await ensureStarted()
       const id = nextId++
 
-      return new Promise<string>((resolve, reject) => {
+      return new Promise<OcrPageText>((resolve, reject) => {
         function onAbort(): void {
           pending.delete(id)
           reject(new Error('Vision OCR timed out'))
         }
 
         pending.set(id, {
-          resolve: (text) => {
+          resolve: (result) => {
             signal.removeEventListener('abort', onAbort)
-            resolve(text)
+            resolve(result)
           },
           reject: (err) => {
             signal.removeEventListener('abort', onAbort)

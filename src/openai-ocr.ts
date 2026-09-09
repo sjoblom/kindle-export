@@ -91,7 +91,8 @@ Do not include any additional text, descriptions, or punctuation. Ignore any emb
         throw new OcrRefusalError(text)
       }
 
-      return text
+      // A model reads the page as prose, so there are no lines to keep.
+      return { text }
     },
 
     async close() {}

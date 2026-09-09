@@ -19,6 +19,8 @@ const CAPTURE_STOP_REASONS: Record<CaptureStopReason, string> = {
   'end-of-book': 'reached the end of the book',
   'past-last-content-page': 'passed the last content page',
   'navigation-failed': 'the reader stopped turning pages',
+  'end-unconfirmed':
+    'the reader still offered a next page but would not turn to it',
   'no-page-nav': 'lost track of the page position',
   interrupted: 'the run was interrupted'
 }
@@ -127,8 +129,13 @@ export function bookCompleteness({
   if (captureStoppedEarly && capture) {
     remedy = 'capture-again'
     summary =
-      `Stopped at page ${capture.lastPage} of ${capture.totalContentPages}` +
-      ' — capture it again to get the rest.'
+      capture.reason === 'end-unconfirmed'
+        ? // The page count looks finished, so "stopped at 310 of 310" would
+          // read as a bug. What is uncertain is the last few screens.
+          'Reached the last page but could not confirm the final screens' +
+          ' were captured — capture it again to be sure.'
+        : `Stopped at page ${capture.lastPage} of ${capture.totalContentPages}` +
+          ' — capture it again to get the rest.'
   } else if (missingPages.length) {
     // Only worth saying on its own: when the capture stopped early the pages
     // without text are the least of the book's problems, and re-capturing

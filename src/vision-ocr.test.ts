@@ -101,7 +101,7 @@ describe.skipIf(!available)('vision OCR engine', () => {
         'jumps over the lazy dog'
       ])
 
-      const text = await engine.recognize({
+      const { text } = await engine.recognize({
         imagePath,
         attempt: 0,
         signal: withTimeout(30_000)
@@ -147,7 +147,7 @@ describe.skipIf(!available)('vision OCR engine', () => {
           attempt: 0,
           signal: withTimeout(30_000)
         })
-      ).split('\n')
+      ).text.split('\n')
 
       // The heading, then three paragraphs: one ended by a blank line, one marked
       // only by the indent that follows it, and one that runs to the page's end.
@@ -181,7 +181,7 @@ describe.skipIf(!available)('vision OCR engine', () => {
       // The worker has to survive a bad page: one unreadable image in a 400 page
       // book must not fail the other 399.
       const imagePath = await writePage('after-failure.png', ['still working'])
-      const text = await engine.recognize({
+      const { text } = await engine.recognize({
         imagePath,
         attempt: 0,
         signal: withTimeout(30_000)
@@ -245,7 +245,7 @@ describe.skipIf(!available)('vision OCR engine', () => {
 
       expect(texts).toHaveLength(markers.length)
       // Each answer must match its own request rather than another page's.
-      for (const [i, text] of texts.entries()) {
+      for (const [i, { text }] of texts.entries()) {
         expect(text.toLowerCase()).toContain(markers[i]!)
       }
     },
@@ -259,11 +259,13 @@ describe.skipIf(!available)('vision OCR engine', () => {
       const imagePath = await writePage('closable.png', ['hello'])
 
       expect(
-        await closable.recognize({
-          imagePath,
-          attempt: 0,
-          signal: withTimeout(30_000)
-        })
+        (
+          await closable.recognize({
+            imagePath,
+            attempt: 0,
+            signal: withTimeout(30_000)
+          })
+        ).text
       ).toContain('hello')
 
       await closable.close()

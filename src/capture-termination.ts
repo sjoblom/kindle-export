@@ -35,11 +35,11 @@ export const NAVIGATION_ATTEMPTS = 5
 /**
  * Turn attempts spent confirming the end of the book.
  *
- * At a genuine end the chevron is usually gone, and that is believed on the
- * first attempt — see `shouldStopCapture` — so these extra attempts only cost
- * time when Kindle leaves a live chevron on the last screen. There, a stalled
- * turn could also be a slow render of one more screen, and a second try is
- * cheaper than truncating the book.
+ * Two, because the one positive sign of an ending — the chevron being gone —
+ * is also what the reader looks like for a moment mid-render. Seeing it gone
+ * twice, a few seconds apart, is the confirmation; seeing it once is not. The
+ * cost is a few seconds on every finished capture, which is the price of not
+ * declaring a book complete on a hunch.
  */
 export const END_CONFIRMATION_ATTEMPTS = 2
 
@@ -170,8 +170,15 @@ export interface NavigationAttemptInput {
  *
  * A successful turn always means "keep capturing", even on the last numbered
  * page — that's the whole point: a last page spanning several screens turns
- * normally, and each of those screens gets captured. Only a refusal to render
- * anything new ends the book.
+ * normally, and each of those screens gets captured.
+ *
+ * Only one thing marks a capture complete: the reader offering no next page,
+ * seen on every attempt this screen was given. A reader that still shows a
+ * usable next-page control and won't turn to it is a reader that has stopped
+ * responding, wherever the footer says we are — the footer counts pages, not
+ * screens, so it cannot vouch for the screens after this one. That case is
+ * recorded as incomplete, and the person can capture again, rather than as a
+ * finished book that is quietly short.
  */
 export function shouldStopCapture({
   navigation,
@@ -183,25 +190,18 @@ export function shouldStopCapture({
     return { type: 'capture-next-screen' }
   }
 
-  const lastAttempt = attempt >= maxAttempts
+  if (attempt < maxAttempts) {
+    return { type: 'retry-navigation' }
+  }
 
   // The reader removes the chevron when there's nowhere left to go, but it
   // also drops it briefly mid-render — so a missing chevron only counts once
-  // we're out of attempts. On the last numbered page it counts at once: the
-  // footer already said to expect the end here, and the two agree.
-  if (navigation === 'no-next-page' && (lastAttempt || onLastNumberedPage)) {
+  // it has stayed missing for every attempt.
+  if (navigation === 'no-next-page') {
     return { type: 'stop', complete: true, reason: 'end-of-book' }
   }
 
-  if (lastAttempt) {
-    // Out of attempts with a next-page control still on screen. On the last
-    // numbered page that's the end confirming itself: the footer says there is
-    // no further page, and the reader won't produce one. Anywhere else it's a
-    // reader that stopped responding, and the capture is genuinely truncated.
-    return onLastNumberedPage
-      ? { type: 'stop', complete: true, reason: 'end-of-book' }
-      : { type: 'stop', complete: false, reason: 'navigation-failed' }
-  }
-
-  return { type: 'retry-navigation' }
+  return onLastNumberedPage
+    ? { type: 'stop', complete: false, reason: 'end-unconfirmed' }
+    : { type: 'stop', complete: false, reason: 'navigation-failed' }
 }

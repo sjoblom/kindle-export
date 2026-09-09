@@ -5,7 +5,7 @@ import path from 'node:path'
 
 import pMap from 'p-map'
 
-import type { OcrEngine } from './ocr-engine'
+import type { OcrEngine, OcrPageText } from './ocr-engine'
 import type { BookMetadata, ContentChunk, TocItem } from './types'
 import {
   createContentWriter,
@@ -214,9 +214,9 @@ export async function transcribeBook({
           // Pinned per iteration: the retry counter is mutated below, and the
           // engine must see the attempt this call actually is.
           const attempt = retries
-          let rawText: string
+          let raw: OcrPageText
           try {
-            rawText = await withAbortTimeout(requestTimeoutMs, (signal) =>
+            raw = await withAbortTimeout(requestTimeoutMs, (signal) =>
               engine.recognize({ imagePath, attempt, signal })
             )
           } catch (err: any) {
@@ -236,7 +236,7 @@ export async function transcribeBook({
             continue
           }
 
-          let text = rawText
+          let text = raw.text
             .replace(/^\s*\d+\s*$\n+/m, '')
             // .replaceAll(/\n+/g, '\n')
             .replaceAll(/^\s*/gm, '')
@@ -277,7 +277,10 @@ export async function transcribeBook({
             index,
             page,
             text,
-            screenshot
+            screenshot,
+            // The engine's own view of the page, when it has one: what `text`
+            // was built from, kept so the building can be redone from disk.
+            ...(raw.lines?.length ? { lines: raw.lines } : {})
           }
           if (VERBOSE_LOGGING) {
             console.log(result)

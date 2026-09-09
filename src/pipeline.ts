@@ -2,10 +2,15 @@ import os from 'node:os'
 import path from 'node:path'
 
 import type { BookMetadata, ContentChunk } from './types'
-import { describeIncompleteCapture } from './capture-status'
+import {
+  type BookCompleteness,
+  bookCompleteness,
+  describeIncompleteCapture
+} from './capture-status'
 import { cleanPageImages, cleanRenderData, formatBytes } from './cleanup'
 import { loadConfig } from './config'
 import {
+  contentPath,
   invalidateContent,
   readContentChunks,
   readContentStore,
@@ -87,11 +92,31 @@ export interface BookResult {
   asin: string
   /** Files written (or already present, for reused stages). */
   outputs: string[]
-  /** Lines explaining that the captured pages are only part of the book. */
-  incompleteCapture?: string[]
-  /** Pages that could not be transcribed; the export is missing them. */
+  /**
+   * How much of the book is on disk once this run finished — read from the
+   * files, not from which stages ran, so `ocr` and `export` on their own
+   * report a truncated book just as loudly as a full run does.
+   */
+  completeness: BookCompleteness
+  /** Pages this run tried to read and could not. */
   failedPages: FailedPage[]
   durationMs: number
+}
+
+/**
+ * Whether the book fell short of what `command` promised.
+ *
+ * `capture` deliberately leaves a book with no text yet, so only the capture
+ * half of completeness counts there; everything else promises readable text
+ * for every captured page as well. The CLI's exit status and the web app's
+ * per-book badge both hang off this, so they can't drift apart.
+ */
+export function bookFellShort(result: BookResult, command: string): boolean {
+  if (result.failedPages.length) return true
+
+  return command === 'capture'
+    ? result.completeness.captureStoppedEarly
+    : !result.completeness.complete
 }
 
 export function defaultProfileDir(): string {
@@ -146,34 +171,32 @@ export async function readContent(
  * without this a run that died at chapter 3 exports cleanly and silently.
  */
 function reportIncompleteCapture(
+  asin: string,
   metadata: BookMetadata,
   emit: EmitEvent
-): string[] | undefined {
-  const lines = describeIncompleteCapture(metadata)
-  if (!lines) return
-
-  for (const line of lines) {
+): void {
+  // With the ASIN, so a reused truncated capture names the exact command that
+  // replaces it instead of leaving the reader to work the flag out.
+  for (const line of describeIncompleteCapture(metadata, asin) ?? []) {
     emit({ kind: 'warn', message: line })
   }
-
-  return lines
 }
 
 async function capture(
   asin: string,
   options: Options,
   emit: EmitEvent
-): Promise<{ metadata: BookMetadata; incompleteCapture?: string[] }> {
+): Promise<BookMetadata> {
   const existing = await readMetadata(options.outDir, asin)
   if (!options.forceCapture && existing?.pages?.length) {
     emit({
       kind: 'info',
       message: `capture: reusing ${existing.pages.length} existing page images`
     })
-    return {
-      metadata: existing,
-      incompleteCapture: reportIncompleteCapture(existing, emit)
-    }
+    // Reusing an interrupted capture produces the same truncated book every
+    // time, so say so here rather than only after the export is written.
+    reportIncompleteCapture(asin, existing, emit)
+    return existing
   }
 
   emit({ kind: 'stage', stage: 'capture' })
@@ -226,7 +249,7 @@ async function capture(
     kind: 'info',
     message: `capture: ${metadata.pages.length} page images`
   })
-  const incompleteCapture = reportIncompleteCapture(metadata, emit)
+  reportIncompleteCapture(asin, metadata, emit)
 
   // Amazon's render payloads are only useful during the capture itself.
   const render = await cleanRenderData(options.outDir, asin)
@@ -237,7 +260,7 @@ async function capture(
     })
   }
 
-  return { metadata, incompleteCapture }
+  return metadata
 }
 
 async function ocr(
@@ -306,8 +329,16 @@ async function ocr(
   }
 
   // Page images are only the input to this step. Once every page has text
-  // they're dead weight, and re-capturing costs time rather than data.
-  if (!options.keepPages && !failedPages.length) {
+  // they're dead weight, and re-capturing costs time rather than data. The
+  // check is coverage, not "this run had no failures": a page skipped for any
+  // other reason leaves text that can never be filled in once its image is
+  // gone. `kindle-export clean` asks the same question the same way.
+  const covered = !bookCompleteness({
+    metadata,
+    content: { captureId: metadata.captureId, chunks: content }
+  }).missingPages.length
+
+  if (!options.keepPages && covered) {
     const pages = await cleanPageImages(options.outDir, asin)
     if (pages.freed) {
       emit({
@@ -326,43 +357,78 @@ export async function processBook(
   emit: EmitEvent = () => {}
 ): Promise<BookResult> {
   const startedAt = Date.now()
+  const bookDir = path.join(options.outDir, asin)
 
-  let incompleteCapture: string[] | undefined
+  // A run can reach the same conclusion twice — the capture stage reports a
+  // reused truncated capture, and the completeness check at the end reports it
+  // again. The reader needs to hear it once.
+  const said = new Set<string>()
+  const emitOnce: EmitEvent = (event) => {
+    if (event.kind === 'warn') {
+      if (said.has(event.message)) return
+      said.add(event.message)
+    }
+
+    emit(event)
+  }
+
   let metadata: BookMetadata | undefined
   if (options.command === 'ocr' || options.command === 'export') {
     metadata = await readMetadata(options.outDir, asin)
   } else {
-    const captured = await capture(asin, options, emit)
-    metadata = captured.metadata
-    incompleteCapture = captured.incompleteCapture
+    metadata = await capture(asin, options, emitOnce)
   }
   assert(
     metadata?.pages?.length,
     `no captured pages — run 'kindle-export capture ${asin}' first`
   )
 
-  if (options.command === 'capture') {
+  let failedPages: FailedPage[] = []
+
+  /**
+   * Finish, reporting how much of the book is actually there.
+   *
+   * Read from the files rather than from what this run did, so `ocr` and
+   * `export` on their own report a truncated capture or a book missing text
+   * just as loudly as a full run does — they used to exit 0 in silence.
+   */
+  const finish = async (outputs: string[]): Promise<BookResult> => {
+    const completeness = bookCompleteness({
+      metadata,
+      content: await readContentStore(bookDir),
+      asin
+    })
+
+    // `capture` deliberately leaves a book with no text yet, so its only
+    // complaint worth making is the capture one — which the stage above has
+    // already made.
+    if (options.command !== 'capture') {
+      for (const message of completeness.warnings) {
+        emitOnce({ kind: 'warn', message })
+      }
+    }
+
     return {
       asin,
-      outputs: [path.join(options.outDir, asin)],
-      incompleteCapture,
-      failedPages: [],
+      outputs,
+      completeness,
+      failedPages,
       durationMs: Date.now() - startedAt
     }
   }
 
+  if (options.command === 'capture') {
+    return finish([bookDir])
+  }
+
   let content: ContentChunk[] | undefined
-  let failedPages: FailedPage[] = []
   if (options.command === 'export') {
     // Same check as the transcribe stage: text left behind by an earlier
     // capture is not this book's text, and exporting it would look like it
     // worked.
-    content = selectReusableChunks(
-      await readContentStore(path.join(options.outDir, asin)),
-      metadata
-    )
+    content = selectReusableChunks(await readContentStore(bookDir), metadata)
   } else {
-    const transcribed = await ocr(asin, metadata, options, emit)
+    const transcribed = await ocr(asin, metadata, options, emitOnce)
     content = transcribed.content
     failedPages = transcribed.failedPages
   }
@@ -372,16 +438,10 @@ export async function processBook(
   )
 
   if (options.command === 'ocr') {
-    return {
-      asin,
-      outputs: [path.join(options.outDir, asin, 'content.json')],
-      incompleteCapture,
-      failedPages,
-      durationMs: Date.now() - startedAt
-    }
+    return finish([contentPath(bookDir)])
   }
 
-  emit({ kind: 'stage', stage: 'export' })
+  emitOnce({ kind: 'stage', stage: 'export' })
   const outputs: string[] = []
   for (const format of options.formats) {
     outputs.push(
@@ -391,11 +451,5 @@ export async function processBook(
     )
   }
 
-  return {
-    asin,
-    outputs,
-    incompleteCapture,
-    failedPages,
-    durationMs: Date.now() - startedAt
-  }
+  return finish(outputs)
 }

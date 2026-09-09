@@ -6,6 +6,7 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { UserConfig } from './config'
+import type * as Pipeline from './pipeline'
 
 // The server reads and writes the stored config; the real one lives in the
 // home directory of whoever runs the tests.
@@ -17,6 +18,54 @@ vi.mock('./config', () => ({
     return '/dev/null'
   }
 }))
+
+/**
+ * Jobs are driven through a stand-in pipeline: the real one opens Chrome and
+ * reads a book for an hour. Everything around it — validation, the single-job
+ * rule, the options the job is started with — is the server's own code.
+ */
+const pipelineCalls = vi.hoisted(() => [] as Array<Record<string, unknown>>)
+const gate = vi.hoisted(() => ({
+  hold: false,
+  release: undefined as (() => void) | undefined
+}))
+
+vi.mock('./pipeline', async (importOriginal) => {
+  const actual = await importOriginal<typeof Pipeline>()
+
+  return {
+    ...actual,
+    processBook: async (asin: string, options: any) => {
+      pipelineCalls.push({
+        asin,
+        command: options.command,
+        forceCapture: options.forceCapture,
+        formats: options.formats
+      })
+
+      if (gate.hold) {
+        await new Promise<void>((resolve) => {
+          gate.release = resolve
+        })
+      }
+
+      return {
+        asin,
+        outputs: [],
+        completeness: {
+          complete: true,
+          capturedPages: 1,
+          transcribedPages: 1,
+          missingPages: [],
+          captureStoppedEarly: false,
+          warnings: []
+        },
+        failedPages: [],
+        durationMs: 1
+      }
+    }
+  }
+})
 
 const { createServeHandle } = await import('./serve')
 const { EMPTY_OPTIONS } = await import('./pipeline')
@@ -33,6 +82,9 @@ let port: number
 
 beforeEach(async () => {
   stored = {}
+  pipelineCalls.length = 0
+  gate.hold = false
+  gate.release = undefined
   vi.stubEnv('OPENAI_API_KEY', '')
 
   outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kindle-export-serve-'))
@@ -54,6 +106,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  gate.release?.()
   await handle.close()
   await fs.rm(outDir, { recursive: true, force: true })
   vi.unstubAllEnvs()
@@ -73,6 +126,23 @@ function post(
     },
     body: JSON.stringify(body ?? {})
   })
+}
+
+/** Wait for something the job runs towards, rather than for a fixed delay. */
+async function until(
+  condition: () => boolean | Promise<boolean>,
+  what: string,
+  timeoutMs = 5000
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!(await condition())) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
+async function getState(): Promise<any> {
+  return (await fetch(handle.url + '/api/state')).json()
 }
 
 /** A request with full header control, for what fetch won't let us send. */
@@ -225,6 +295,74 @@ describe('serve', () => {
 
     const absent = await fetch(handle.url + '/api/download/B00TEST/absent.md')
     expect(absent.status).toBe(404)
+  })
+
+  it('captures a book again when the page asks it to', async () => {
+    // The only way out of a capture that stopped part-way: without this the
+    // same truncated book is rebuilt from the same pages every time.
+    vi.stubEnv('OPENAI_API_KEY', 'sk-test')
+
+    const res = await post('/api/export', {
+      asins: ['B00TEST'],
+      formats: ['md'],
+      forceCapture: true
+    })
+    expect(res.status).toBe(202)
+
+    await until(() => pipelineCalls.length === 1, 'the book to be processed')
+    expect(pipelineCalls[0]).toMatchObject({
+      asin: 'B00TEST',
+      command: 'all',
+      forceCapture: true
+    })
+
+    // The page needs to know a run is a re-capture, not an ordinary export.
+    expect((await getState()).job.forceCapture).toBe(true)
+  })
+
+  it('resumes rather than re-captures for an ordinary export', async () => {
+    // Retrying unreadable pages must not throw away an hour of capture; the
+    // pipeline resumes page by page when it is left alone.
+    vi.stubEnv('OPENAI_API_KEY', 'sk-test')
+
+    expect((await post('/api/export', { asins: ['B00TEST'] })).status).toBe(202)
+
+    await until(() => pipelineCalls.length === 1, 'the book to be processed')
+    expect(pipelineCalls[0]).toMatchObject({ forceCapture: false })
+  })
+
+  it('re-captures one book at a time', async () => {
+    vi.stubEnv('OPENAI_API_KEY', 'sk-test')
+
+    const res = await post('/api/export', {
+      asins: ['B00TEST', 'B00OTHER'],
+      forceCapture: true
+    })
+    expect(res.status).toBe(400)
+    expect(pipelineCalls).toHaveLength(0)
+  })
+
+  it('refuses a second run while one is going', async () => {
+    // One browser, one profile: the busy rule has to hold for a re-capture
+    // started from the downloads list too.
+    vi.stubEnv('OPENAI_API_KEY', 'sk-test')
+    gate.hold = true
+
+    expect((await post('/api/export', { asins: ['B00TEST'] })).status).toBe(202)
+    await until(() => pipelineCalls.length === 1, 'the first job to start')
+
+    const second = await post('/api/export', {
+      asins: ['B00TEST'],
+      forceCapture: true
+    })
+    expect(second.status).toBe(409)
+    expect(pipelineCalls).toHaveLength(1)
+
+    gate.release?.()
+    await until(
+      async () => (await getState()).busy === null,
+      'the first job to finish'
+    )
   })
 
   it('stays quiet about unknown routes', async () => {

@@ -452,6 +452,8 @@ function renderAmazon() {
     msg.textContent = 'Finish signing in inside the Chrome window that opened.'
   } else if (state.amazon === 'signed-out') {
     msg.textContent = 'Amazon signed you out — sign in to continue.'
+  } else if (state.amazonError) {
+    msg.textContent = state.amazonError
   } else {
     msg.textContent = ''
   }
@@ -513,9 +515,15 @@ function buildBookList(byAsin) {
     var row = el('label', { class: 'bookrow', 'data-search': (book.title + ' ' + (book.authors || []).join(' ')).toLowerCase() }, box, meta)
 
     if (disk && disk.exports.length) {
-      var incomplete = (disk.incompleteCapture && disk.incompleteCapture.length) ||
-        disk.transcribedPages < disk.capturedPages
-      row.appendChild(incomplete ? pill('warn', 'exported, missing pages') : pill('good', 'exported'))
+      row.appendChild(disk.completeness.complete
+        ? pill('good', 'exported')
+        : pill('warn', disk.completeness.remedy === 'capture-again'
+          ? 'exported, stopped early'
+          : 'exported, missing pages'))
+    } else if (disk && !disk.completeness.complete && disk.completeness.capturedPages) {
+      // Captured but never finished: without this the only sign is a book that
+      // silently exports short every time it is picked.
+      row.appendChild(pill('warn', 'unfinished'))
     } else if (book.resourceType && book.resourceType.indexOf('SAMPLE') !== -1) {
       row.appendChild(pill('idle', 'sample'))
     }
@@ -656,7 +664,11 @@ function bar(fraction) {
 }
 
 function renderDone() {
-  var books = state.diskBooks.filter(function (b) { return b.exports.length })
+  // Unfinished books belong here too, even with nothing to download yet: this
+  // is where the button that finishes them lives.
+  var books = state.diskBooks.filter(function (b) {
+    return b.exports.length || (b.completeness.remedy && b.completeness.capturedPages)
+  })
   $('card-done').hidden = !books.length
   if (!books.length) return
 
@@ -665,13 +677,15 @@ function renderDone() {
   var holder = $('done-list')
   holder.textContent = ''
   books.forEach(function (book) {
+    var done = book.completeness.complete
     var row = el('div', { class: 'jobrow' },
       el('div', { class: 'toprow' },
         el('div', { class: 'title', text: book.title || book.asin }),
-        (book.incompleteCapture && book.incompleteCapture.length) ||
-        book.transcribedPages < book.capturedPages
-          ? pill('warn', 'missing pages')
-          : pill('good', 'complete')))
+        done
+          ? pill('good', 'complete')
+          : pill('warn', book.completeness.remedy === 'capture-again'
+            ? 'stopped part-way'
+            : 'missing pages')))
 
     var files = el('div', { class: 'filedone' })
     book.exports.forEach(function (file) {
@@ -681,7 +695,7 @@ function renderDone() {
         text: '⬇ ' + file.name
       }))
     })
-    if (state.platform === 'darwin') {
+    if (state.platform === 'darwin' && book.exports.length) {
       files.appendChild(el('button', {
         class: 'small',
         text: 'Show in Finder',
@@ -690,19 +704,55 @@ function renderDone() {
         }
       }))
     }
-    row.appendChild(files)
+    if (book.completeness.remedy) files.appendChild(repairButton(book))
+    if (files.children.length) row.appendChild(files)
 
-    if (book.incompleteCapture && book.incompleteCapture.length) {
-      row.appendChild(el('div', { class: 'warnnote', text: book.incompleteCapture[0] }))
-    } else if (book.transcribedPages < book.capturedPages) {
-      row.appendChild(el('div', {
-        class: 'warnnote',
-        text: (book.capturedPages - book.transcribedPages) + ' pages could not be read — export it again to retry them'
-      }))
+    if (book.completeness.summary) {
+      row.appendChild(el('div', { class: 'warnnote', text: book.completeness.summary }))
     }
 
     holder.appendChild(row)
   })
+}
+
+/**
+ * The one action that fixes this book.
+ *
+ * A capture that stopped early has to be taken again from the start — asking
+ * for the export a second time just rebuilds the same truncated book. Pages
+ * that could not be read are a different matter: those resume page by page, so
+ * an ordinary run retries exactly them.
+ */
+function repairButton(book) {
+  var recapture = book.completeness.remedy === 'capture-again'
+  var btn = el('button', {
+    class: 'small',
+    text: recapture ? 'Capture again' : 'Retry unreadable pages'
+  })
+  btn.disabled = !!state.busy
+  btn.addEventListener('click', function () {
+    btn.disabled = true
+    api('/api/export', {
+      asins: [book.asin],
+      formats: exportFormatsFor(book),
+      forceCapture: recapture
+    }).catch(function (err) {
+      btn.disabled = false
+      toast(err.message)
+    })
+  })
+
+  return btn
+}
+
+/** Redo the formats this book already has, so nothing it had disappears. */
+function exportFormatsFor(book) {
+  var formats = []
+  book.exports.forEach(function (file) {
+    if (formats.indexOf(file.format) === -1) formats.push(file.format)
+  })
+
+  return formats.length ? formats : ['md']
 }
 
 // ------------------------------------------------------------------ wiring

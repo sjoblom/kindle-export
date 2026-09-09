@@ -2,8 +2,8 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 
 import type { BookMetadata } from './types'
-import { describeIncompleteCapture } from './capture-status'
-import { readContentChunks } from './content-store'
+import { type BookCompleteness, bookCompleteness } from './capture-status'
+import { readContentStore } from './content-store'
 import { normalizeAuthors, tryReadJsonFile } from './utils'
 
 /**
@@ -26,18 +26,13 @@ export interface BookStatus {
   asin: string
   title?: string
   authors?: string[]
-  /** Page images captured (the count survives cleanup; the images may not). */
-  capturedPages: number
-  /** Lines explaining a capture that stopped before the end of the book. */
-  incompleteCapture?: string[]
-  /** Pages with transcribed text. */
-  transcribedPages: number
+  /**
+   * How much of the book is actually on disk, and what would fix it if the
+   * answer is "not all of it". The same check the pipeline and CLI use, so a
+   * badge here can never disagree with what an export just said.
+   */
+  completeness: BookCompleteness
   exports: BookExportFile[]
-}
-
-/** Pages the finished export is missing, if any. */
-export function missingPages(status: BookStatus): number {
-  return Math.max(0, status.capturedPages - status.transcribedPages)
 }
 
 async function scanBook(
@@ -48,7 +43,7 @@ async function scanBook(
   const metadata = await tryReadJsonFile<BookMetadata>(
     path.join(bookDir, 'metadata.json')
   )
-  const content = await readContentChunks(bookDir)
+  const content = await readContentStore(bookDir)
 
   const exports: BookExportFile[] = []
   const entries = await fs
@@ -76,9 +71,16 @@ async function scanBook(
     })
   }
 
-  const capturedPages = metadata?.pages?.length ?? 0
-  const transcribedPages = Array.isArray(content) ? content.length : 0
-  if (!capturedPages && !transcribedPages && !exports.length) return
+  // No asin: these lines are read in a browser, where the remedy is a button
+  // rather than a command to type.
+  const completeness = bookCompleteness({ metadata, content })
+  if (
+    !completeness.capturedPages &&
+    !completeness.transcribedPages &&
+    !exports.length
+  ) {
+    return
+  }
 
   return {
     asin,
@@ -86,11 +88,7 @@ async function scanBook(
     authors: metadata?.meta?.authorList
       ? normalizeAuthors(metadata.meta.authorList)
       : undefined,
-    capturedPages,
-    incompleteCapture: metadata
-      ? describeIncompleteCapture(metadata)
-      : undefined,
-    transcribedPages,
+    completeness,
     exports: exports.toSorted((a, b) => a.name.localeCompare(b.name))
   }
 }

@@ -4,7 +4,7 @@ import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { missingPages, scanBooks } from './book-status'
+import { scanBooks } from './book-status'
 
 let outDir: string
 
@@ -78,11 +78,14 @@ describe('scanBooks', () => {
     expect(book).toMatchObject({
       asin: 'B001',
       title: 'Book B001',
-      authors: ['Jane Doe'],
-      capturedPages: 3,
-      transcribedPages: 2
+      authors: ['Jane Doe']
     })
-    expect(missingPages(book!)).toBe(1)
+    expect(book!.completeness).toMatchObject({
+      complete: false,
+      capturedPages: 3,
+      transcribedPages: 2,
+      remedy: 'transcribe-again'
+    })
   })
 
   it('lists exported files with their formats', async () => {
@@ -112,7 +115,12 @@ describe('scanBooks', () => {
     })
 
     const [book] = await scanBooks(outDir)
-    expect(book!.incompleteCapture?.[0]).toMatch(/stopped at page 5 of 300/)
+    // The badge and the sentence under it both come from here, so the web app
+    // never has to work out what "incomplete" means for itself.
+    expect(book!.completeness.remedy).toBe('capture-again')
+    expect(book!.completeness.summary).toMatch(/page 5 of 300/)
+    // No flags: this is read in a browser, where the remedy is a button.
+    expect(book!.completeness.summary).not.toContain('--force-capture')
   })
 
   it('skips hidden directories and books with nothing in them', async () => {
@@ -131,8 +139,9 @@ describe('scanBooks', () => {
     await fs.writeFile(path.join(bookDir, 'the-book.md'), 'text')
 
     const [book] = await scanBooks(outDir)
-    expect(book).toMatchObject({
-      asin: 'B006',
+    expect(book).toMatchObject({ asin: 'B006' })
+    expect(book!.completeness).toMatchObject({
+      complete: true,
       capturedPages: 0,
       transcribedPages: 0
     })

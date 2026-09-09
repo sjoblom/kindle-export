@@ -6,13 +6,22 @@ import path from 'node:path'
 
 import { type BookStatus, scanBooks } from './book-status'
 import { loadConfig, saveConfig } from './config'
-import { hideBrowserWindow, launchBrowserContext } from './extract-kindle-book'
+import {
+  hideBrowserWindow,
+  isProfileBusyError,
+  launchBrowserContext
+} from './extract-kindle-book'
 import {
   fetchLibrary,
   type LibraryBook,
   NotSignedInError
 } from './kindle-library'
-import { type Options, type PipelineEvent, processBook } from './pipeline'
+import {
+  bookFellShort,
+  type Options,
+  type PipelineEvent,
+  processBook
+} from './pipeline'
 import { renderPage } from './serve-page'
 import { interactiveLogin } from './session'
 import { getEnv } from './utils'
@@ -74,6 +83,8 @@ export interface BookJobState {
 export interface JobState {
   state: 'running' | 'done' | 'stopped'
   stopRequested: boolean
+  /** This run is re-capturing from scratch rather than resuming. */
+  forceCapture: boolean
   startedAt: number
   finishedAt?: number
   books: BookJobState[]
@@ -95,6 +106,8 @@ interface AppState {
   busy: Busy
   library?: { books: LibraryBook[]; fetchedAt: number }
   libraryError?: string
+  /** Why the last sign-in attempt could not open a browser at all. */
+  amazonError?: string
   diskBooks: BookStatus[]
   job?: JobState
 }
@@ -112,6 +125,55 @@ class HttpError extends Error {
   ) {
     super(message)
   }
+}
+
+export interface ExportRequest {
+  asins: string[]
+  formats: Array<'md' | 'pdf'>
+  /**
+   * Throw the existing page images away and read the book again.
+   *
+   * The web app's only remedy for a capture that stopped part-way: reusing
+   * those pages produces the same truncated book however many times it is
+   * asked. Off for an ordinary export, which resumes page by page.
+   */
+  forceCapture: boolean
+}
+
+/**
+ * Validate an export request from the page.
+ *
+ * Separate from starting the job so it can be tested without a browser, and so
+ * every rejection happens before anything is launched.
+ */
+export function parseExportRequest(body: any): ExportRequest {
+  const asins: unknown = body?.asins
+  if (!Array.isArray(asins) || !asins.length) {
+    throw new HttpError(400, 'select at least one book')
+  }
+  if (asins.length > MAX_BOOKS_PER_JOB) {
+    throw new HttpError(400, `at most ${MAX_BOOKS_PER_JOB} books per export`)
+  }
+  for (const asin of asins) {
+    if (typeof asin !== 'string' || !ASIN_REGEX.test(asin)) {
+      throw new HttpError(400, `invalid ASIN: ${String(asin)}`)
+    }
+  }
+
+  const formats: Array<'md' | 'pdf'> = Array.isArray(body.formats)
+    ? body.formats.filter((f: unknown) => f === 'md' || f === 'pdf')
+    : ['md']
+  if (!formats.length) formats.push('md')
+
+  // Re-capturing a book costs an hour of browser time, so it happens only when
+  // the page asked for it in so many words — anything else is an ordinary
+  // resuming export.
+  const forceCapture = body.forceCapture === true
+  if (forceCapture && asins.length > 1) {
+    throw new HttpError(400, 'capture one book again at a time')
+  }
+
+  return { asins: asins as string[], formats, forceCapture }
 }
 
 export async function createServeHandle(
@@ -214,6 +276,7 @@ class App {
   private busy: Busy = null
   private library?: { books: LibraryBook[]; fetchedAt: number }
   private libraryError?: string
+  private amazonError?: string
   private diskBooks: BookStatus[] = []
   private job?: JobState
   private model?: string
@@ -254,6 +317,7 @@ class App {
       busy: this.busy,
       library: this.library,
       libraryError: this.libraryError,
+      amazonError: this.amazonError,
       diskBooks: this.diskBooks,
       job: this.job
     }
@@ -492,14 +556,19 @@ class App {
     this.requireIdle()
     this.busy = 'login'
     this.amazon = 'signing-in'
+    this.amazonError = undefined
     this.broadcast()
 
     void (async () => {
       try {
         const confirmed = await interactiveLogin(this.options.profileDir)
         this.amazon = confirmed ? 'signed-in' : 'unknown'
-      } catch {
+      } catch (err) {
         this.amazon = 'unknown'
+        // The one failure that isn't the user closing the window: a terminal
+        // command is holding the browser profile. Nothing was tried against
+        // Amazon, so say what to do rather than showing "not checked yet".
+        if (isProfileBusyError(err)) this.amazonError = describeBusyProfile()
       } finally {
         this.busy = null
         this.broadcast()
@@ -526,7 +595,9 @@ class App {
       const context = await launchBrowserContext({
         profileDir: this.options.profileDir
       }).catch((err: Error) => {
-        this.libraryError = err.message
+        this.libraryError = isProfileBusyError(err)
+          ? describeBusyProfile()
+          : err.message
         return undefined
       })
 
@@ -566,30 +637,15 @@ class App {
       throw new HttpError(400, 'store an OpenAI API key in Settings first')
     }
 
-    const asins: unknown = body.asins
-    if (!Array.isArray(asins) || !asins.length) {
-      throw new HttpError(400, 'select at least one book')
-    }
-    if (asins.length > MAX_BOOKS_PER_JOB) {
-      throw new HttpError(400, `at most ${MAX_BOOKS_PER_JOB} books per export`)
-    }
-    for (const asin of asins) {
-      if (typeof asin !== 'string' || !ASIN_REGEX.test(asin)) {
-        throw new HttpError(400, `invalid ASIN: ${String(asin)}`)
-      }
-    }
-
-    const formats: Array<'md' | 'pdf'> = Array.isArray(body.formats)
-      ? body.formats.filter((f: unknown) => f === 'md' || f === 'pdf')
-      : ['md']
-    if (!formats.length) formats.push('md')
+    const request = parseExportRequest(body)
 
     this.busy = 'export'
     this.job = {
       state: 'running',
       stopRequested: false,
       startedAt: Date.now(),
-      books: (asins as string[]).map((asin) => ({
+      forceCapture: request.forceCapture,
+      books: request.asins.map((asin) => ({
         asin,
         title: this.titleFor(asin),
         status: 'queued',
@@ -600,7 +656,7 @@ class App {
     }
     this.broadcast()
 
-    void this.runJob(formats)
+    void this.runJob(request)
   }
 
   private titleFor(asin: string): string {
@@ -611,7 +667,10 @@ class App {
     )
   }
 
-  private async runJob(formats: Array<'md' | 'pdf'>): Promise<void> {
+  private async runJob({
+    formats,
+    forceCapture
+  }: ExportRequest): Promise<void> {
     const job = this.job!
 
     // Settings may have changed since the server started; the stored config
@@ -624,7 +683,11 @@ class App {
       formats,
       model: this.model ?? stored.model,
       concurrency: this.options.concurrency ?? stored.concurrency,
-      forceCapture: false,
+      // A re-capture throws the pages away and reads the book from the start,
+      // which is the only way out of a capture that stopped early. It also
+      // drops the old transcription, so nothing from the truncated book
+      // survives into the new export.
+      forceCapture,
       forceOcr: false,
       forceExport: false,
       // Keep the capture window minimized: from the web app's point of view a
@@ -644,10 +707,11 @@ class App {
         })
 
         book.outputs = result.outputs.map((file) => path.basename(file))
-        book.status =
-          result.incompleteCapture?.length || result.failedPages.length
-            ? 'warning'
-            : 'done'
+        // The same verdict the CLI's exit status uses, so a book badged
+        // "done" here is a book the terminal would have called finished.
+        book.status = bookFellShort(result, jobOptions.command)
+          ? 'warning'
+          : 'done'
       } catch (err) {
         book.status = 'failed'
         book.error = (err as Error)?.message ?? String(err)
@@ -768,6 +832,19 @@ class App {
     }
     createReadStream(filePath).pipe(res)
   }
+}
+
+/**
+ * The browser profile is held by a kindle-export run outside this app — the
+ * server's own jobs are excluded by `requireIdle`, so this is a terminal
+ * command. A pid means nothing to the person reading the page; what they can
+ * act on is the other window.
+ */
+function describeBusyProfile(): string {
+  return (
+    'Another kindle-export is using the browser right now. ' +
+    'Wait for it to finish, or close its Chrome window, then try again.'
+  )
 }
 
 /**

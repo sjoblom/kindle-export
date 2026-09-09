@@ -80,11 +80,12 @@ read. The pipeline is three stages:
 Re-running skips any stage whose output already exists, but how much of a
 half-finished book survives depends on the stage. A capture that was
 interrupted cannot be continued: it is reported as incomplete, and the book has
-to be captured again from the beginning. Transcription resumes at page
-granularity — if some pages fail, re-running retries only those, rather than
-paying to read the whole book again. Export is regenerated from `content.json`
-whenever it is asked for, so it costs nothing to redo. Use `--force-ocr` (or
-`--force`) to redo a stage deliberately.
+to be captured again from the beginning with `--force-capture` (the web app
+shows a **Capture again** button on such a book instead). Transcription
+resumes at page granularity — if some pages fail, re-running retries only
+those, rather than paying to read the whole book again. Export is regenerated
+from `content.json` whenever it is asked for, so it costs nothing to redo. Use
+`--force-ocr` (or `--force`) to redo a stage deliberately.
 
 Pages that could never be read are listed explicitly and the command exits
 non-zero — an export with holes in it isn't success, even though a file was

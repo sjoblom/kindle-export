@@ -8,13 +8,15 @@ import { fileURLToPath } from 'node:url'
 
 import { checkbox, confirm, input, password } from '@inquirer/prompts'
 
+import { bookCompleteness } from './capture-status'
 import { cleanPageImages, cleanRenderData, formatBytes } from './cleanup'
 import { loadConfig, saveConfig } from './config'
-import { readContentStore, selectReusableChunks } from './content-store'
-import { launchBrowserContext } from './extract-kindle-book'
+import { readContentStore } from './content-store'
+import { isProfileBusyError, launchBrowserContext } from './extract-kindle-book'
 import { fetchLibrary, type LibraryBook } from './kindle-library'
 import {
   applyConfig,
+  bookFellShort,
   EMPTY_OPTIONS,
   type Options,
   type PipelineEvent,
@@ -106,8 +108,8 @@ const FILTER_PROMPT_THRESHOLD = 30
 
 const ASIN_REGEX = /^[A-Z0-9]+$/
 
-/** Books that produced output but are missing pages. */
-const failedBooks = new Set<string>()
+/** Books that produced output but are missing part of the book. */
+const incompleteBooks = new Set<string>()
 
 /** Shown by `setup` as the suggested transcription model. */
 const DEFAULT_MODEL = 'gpt-4.1-mini'
@@ -362,28 +364,21 @@ async function clean(options: Options): Promise<void> {
     const render = await cleanRenderData(options.outDir, asin)
     freed += render.freed
 
-    // Page images only go when the text is complete, otherwise a retry
-    // silently becomes a re-capture.
+    // Page images only go when every captured page has text, otherwise a retry
+    // silently becomes a re-capture. This is the same question the transcribe
+    // stage asks before deleting them, asked the same way.
     let pages = { freed: 0, removed: [] as string[] }
     if (!options.keepPages) {
       const metadata = await readMetadata(options.outDir, asin)
-      // Only text belonging to the capture that is on disk counts as done:
-      // chunks left over from a previous capture would otherwise licence
-      // deleting page images that have never been read.
-      const content = metadata
-        ? selectReusableChunks(
-            await readContentStore(path.join(options.outDir, asin)),
-            metadata
-          )
-        : []
-      const complete =
-        !!content.length &&
-        !!metadata?.pages?.length &&
-        content.length >= metadata.pages.length
+      const completeness = bookCompleteness({
+        metadata,
+        content: await readContentStore(path.join(options.outDir, asin)),
+        asin
+      })
 
-      if (complete) {
+      if (completeness.capturedPages && !completeness.missingPages.length) {
         pages = await cleanPageImages(options.outDir, asin)
-      } else if (content.length) {
+      } else if (completeness.transcribedPages) {
         console.log(
           `[${asin}] keeping page images: transcription is incomplete`
         )
@@ -581,8 +576,12 @@ async function main() {
     try {
       const result = await processBook(asin, options, renderEvents(asin))
 
-      if (result.incompleteCapture?.length || result.failedPages.length) {
-        failedBooks.add(asin)
+      // A book can be short of what was asked for without anything throwing:
+      // a capture that stopped early, or pages with no text. Every command
+      // decides that the same way, so `ocr` and `export` on their own report
+      // it too instead of exiting 0 in silence.
+      if (bookFellShort(result, options.command)) {
+        incompleteBooks.add(asin)
       }
 
       if (options.command === 'all' || options.command === 'export') {
@@ -602,14 +601,14 @@ async function main() {
     console.error(`\n${failures.length} of ${options.asins.length} failed`)
   }
 
-  if (failedBooks.size) {
+  if (incompleteBooks.size) {
     console.error(
-      `${failedBooks.size} book(s) exported with missing pages: ${[...failedBooks].join(', ')}`
+      `${incompleteBooks.size} book(s) are missing part of the book: ${[...incompleteBooks].join(', ')}`
     )
   }
 
   // Incomplete output is not success, even though a file was written.
-  if (failures.length || failedBooks.size) {
+  if (failures.length || incompleteBooks.size) {
     process.exitCode = 1
   }
 }
@@ -635,5 +634,15 @@ function isDirectEntryPoint(): boolean {
 }
 
 if (isDirectEntryPoint()) {
-  await main()
+  try {
+    await main()
+  } catch (err) {
+    // A profile that's already in use is an everyday situation — the web app is
+    // mid-capture in another window — not a crash. Say what to do about it
+    // instead of printing a stack trace; everything else keeps its stack.
+    if (!isProfileBusyError(err)) throw err
+
+    console.error(`kindle-export: ${err.message}`)
+    process.exitCode = 1
+  }
 }

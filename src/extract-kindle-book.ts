@@ -21,6 +21,19 @@ import type {
   PageNav,
   TocItem
 } from './types'
+import {
+  inspectProfileLock,
+  isProfileBusyError,
+  ProfileBusyError
+} from './browser-profile-lock'
+import {
+  chevronClickTimeoutMs,
+  isOnLastNumberedPage,
+  maxNavigationAttempts,
+  navigationTimeoutMs,
+  shouldStopBeforeCapture,
+  shouldStopCapture
+} from './capture-termination'
 import { parsePageNav, parseTocItems } from './playwright-utils'
 import {
   assert,
@@ -74,6 +87,10 @@ function warnVerbose(...args: any[]) {
   }
 }
 
+// Re-exported so callers that only know about `launchBrowserContext` can
+// recognise its one expected failure without a second import.
+export { isProfileBusyError, ProfileBusyError } from './browser-profile-lock'
+
 export type BrowserContext = Awaited<
   ReturnType<typeof chromium.launchPersistentContext>
 >
@@ -104,60 +121,27 @@ async function cleanupStaleSingletonLocks(profileDir: string) {
   }
 }
 
-/** Signal 0 checks for the process without touching it. */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch {
-    return false
-  }
-}
-
+/**
+ * Make sure nothing else is using the shared browser profile.
+ *
+ * A stale lock is cleared; a live owner is reported. This used to kill the pid
+ * named in the lock, which meant a second command — `list`, `login`, another
+ * `serve` — silently killed the browser the web app was capturing with, and a
+ * recycled pid meant killing a process that had nothing to do with us.
+ */
 async function ensureBrowserProfileAvailable(profileDir: string) {
   const lockPath = path.join(profileDir, 'SingletonLock')
   const linkTarget = await fs.readlink(lockPath).catch(() => undefined)
-  if (!linkTarget) return
 
-  const pidMatch = linkTarget.match(/-(\d+)$/)
-  if (!pidMatch) {
-    await cleanupStaleSingletonLocks(profileDir)
-    return
+  const lock = await inspectProfileLock({ profileDir, linkTarget })
+
+  if (lock.state === 'unlocked') return
+
+  if (lock.state === 'busy') {
+    throw new ProfileBusyError(lock.pid, profileDir)
   }
 
-  const pid = Number.parseInt(pidMatch[1]!, 10)
-  if (Number.isNaN(pid)) {
-    await cleanupStaleSingletonLocks(profileDir)
-    return
-  }
-
-  if (!isProcessAlive(pid)) {
-    await cleanupStaleSingletonLocks(profileDir)
-    return
-  }
-
-  console.warn(
-    `existing automation browser process detected for shared profile (pid ${pid}); terminating...`
-  )
-  try {
-    process.kill(pid, 'SIGTERM')
-  } catch {}
-  await delay(500)
-
-  if (isProcessAlive(pid)) {
-    try {
-      process.kill(pid, 'SIGKILL')
-    } catch {}
-    await delay(250)
-  }
-
-  // Removing the locks while something still holds the profile hands Chrome a
-  // directory another process is writing to. Better to stop here and say so.
-  assert(
-    !isProcessAlive(pid),
-    `shared browser profile is still locked by pid ${pid}; close that browser and retry`
-  )
-
+  warnVerbose(`clearing a stale browser profile lock (${lock.reason})`)
   await cleanupStaleSingletonLocks(profileDir)
 }
 
@@ -252,6 +236,12 @@ export async function launchBrowserContext(
       return context
     } catch (err) {
       await context?.close().catch(() => {})
+
+      // Someone else is legitimately using the profile. Retrying can't help,
+      // and the retry warning would bury the one message worth reading.
+      if (isProfileBusyError(err)) {
+        throw err
+      }
 
       // Google Chrome isn't installed (usual on Linux and in containers), so
       // fall back to the Chromium that ships with Playwright.
@@ -363,6 +353,7 @@ export async function extractBook(
   await fs.mkdir(pageScreenshotsDir, { recursive: true })
 
   const krRendererMainImageSelector = '#kr-renderer .kg-full-page-img img'
+  const nextPageChevronSelector = '.kr-chevron-container-right'
   const bookReaderUrl = `https://read.amazon.com/?asin=${asin}`
 
   const result: SetRequired<Partial<BookMetadata>, 'pages' | 'nav'> = {
@@ -932,6 +923,35 @@ export async function extractBook(
       )
     }
 
+    /**
+     * Whether the reader is still offering a next page.
+     *
+     * Kindle takes the right-hand chevron away at the end of the book, and can
+     * leave it in place but disabled instead. Only ever consulted after a page
+     * turn produced nothing, and anything unreadable counts as "still there":
+     * a missing chevron is what declares a book finished, and being wrong that
+     * way round truncates it silently.
+     */
+    async function hasUsableNextPageChevron(): Promise<boolean> {
+      try {
+        const chevron = page.locator(nextPageChevronSelector).first()
+        if ((await chevron.count()) === 0) return false
+        if (!(await chevron.isVisible())) return false
+
+        const disabled = await chevron.evaluate(
+          (el) =>
+            el.hasAttribute('disabled') ||
+            el.getAttribute('aria-disabled') === 'true' ||
+            el.classList.contains('disabled') ||
+            !!el.querySelector('[disabled], [aria-disabled="true"], .disabled')
+        )
+
+        return !disabled
+      } catch {
+        return true
+      }
+    }
+
     async function getPageNav() {
       const footerText = await page
         .locator('ion-footer ion-title')
@@ -1172,17 +1192,23 @@ export async function extractBook(
       })
       const footerCurrentValue = pageNav?.page ?? pageNav?.location
 
-      if (!pageNav) {
-        console.warn('lost track of the page position; stopping', { index })
-        capture.reason = 'no-page-nav'
+      const stopBeforeCapture = shouldStopBeforeCapture({
+        hasPageNav: !!pageNav,
+        currentPage: currentNavPage,
+        totalContentPages: result.nav.totalNumContentPages
+      })
+
+      if (stopBeforeCapture) {
+        if (stopBeforeCapture.reason === 'no-page-nav') {
+          console.warn('lost track of the page position; stopping', { index })
+        }
+
+        capture.complete = stopBeforeCapture.complete
+        capture.reason = stopBeforeCapture.reason
         break
       }
 
-      if (currentNavPage > result.nav.totalNumContentPages) {
-        capture.complete = true
-        capture.reason = 'past-last-content-page'
-        break
-      }
+      assert(pageNav, 'expected a page nav after the pre-capture check')
 
       const src = (await page
         .locator(krRendererMainImageSelector)
@@ -1264,34 +1290,42 @@ export async function extractBook(
       }
       await writeResultMetadata()
 
-      if (
-        footerCurrentValue !== undefined &&
-        pageNav.total > 0 &&
-        footerCurrentValue >= pageNav.total
-      ) {
-        warnInfo('reached end of book based on footer nav', pageNav)
-        capture.complete = true
-        capture.reason = 'end-of-book'
-        done = true
-        break
-      }
+      // The footer reaching the last page means "this is probably the last
+      // screen", not "stop now": Kindle's page numbers are coarse, so the last
+      // numbered page can span several rendered screens and the first of them
+      // reads exactly like the last. Turning the page is the only thing that
+      // tells them apart, so we always try — the footer only decides how long
+      // to spend on the attempt.
+      const onLastNumberedPage = isOnLastNumberedPage({
+        value: footerCurrentValue,
+        total: pageNav.total
+      })
+      const maxAttempts = maxNavigationAttempts(onLastNumberedPage)
 
-      let retries = 0
-
-      do {
+      for (let attempt = 1; ; attempt++) {
         // This delay seems to help speed up the navigation process, possibly due
         // to the navigation chevron needing time to settle.
         await delay(100)
 
-        let navigationTimeout = 10_000
+        let clickFailed = false
         try {
           // await page.keyboard.press('ArrowRight')
           await page
-            .locator('.kr-chevron-container-right')
-            .click({ timeout: 5000 })
+            .locator(nextPageChevronSelector)
+            .click({ timeout: chevronClickTimeoutMs(onLastNumberedPage) })
         } catch (err: any) {
-          console.warn('unable to click next page button', err.message, pageNav)
-          navigationTimeout = 1000
+          // Expected at the end of the book, where there's no chevron to click.
+          if (onLastNumberedPage) {
+            logVerbose('no next page button on the final page', err.message)
+          } else {
+            console.warn(
+              'unable to click next page button',
+              err.message,
+              pageNav
+            )
+          }
+
+          clickFailed = true
         }
 
         const navigatedToNextPage = await pRace<boolean | undefined>(
@@ -1314,44 +1348,37 @@ export async function extractBook(
               return false
             })(),
 
-            delay(navigationTimeout, { signal })
+            delay(navigationTimeoutMs({ onLastNumberedPage, clickFailed }), {
+              signal
+            })
           ]
         )
 
-        if (navigatedToNextPage) {
-          break
+        const action = shouldStopCapture({
+          navigation: navigatedToNextPage
+            ? 'navigated'
+            : (await hasUsableNextPageChevron())
+              ? 'stalled'
+              : 'no-next-page',
+          onLastNumberedPage,
+          attempt,
+          maxAttempts
+        })
+
+        if (action.type === 'capture-next-screen') break
+        if (action.type === 'retry-navigation') continue
+
+        if (action.reason === 'end-of-book') {
+          warnInfo('reached the end of the book', pageNav)
+        } else {
+          console.warn('unable to navigate to next page; breaking...', pageNav)
         }
 
-        if (++retries >= 5) {
-          // Kindle removes the right-hand chevron when there is no next page.
-          // Checked only after every retry has failed, so a chevron that's
-          // briefly missing mid-render can't be mistaken for the end of the
-          // book — declaring the end early would truncate it silently, which
-          // is the failure this whole marker exists to catch.
-          const hasNextPageChevron = await page
-            .locator('.kr-chevron-container-right')
-            .count()
-            .catch(() => 1)
-
-          if (hasNextPageChevron) {
-            console.warn(
-              'unable to navigate to next page; breaking...',
-              pageNav
-            )
-            capture.reason = 'navigation-failed'
-          } else {
-            warnInfo(
-              'no next-page chevron; reached the end of the book',
-              pageNav
-            )
-            capture.complete = true
-            capture.reason = 'end-of-book'
-          }
-
-          done = true
-          break
-        }
-      } while (true)
+        capture.complete = action.complete
+        capture.reason = action.reason
+        done = true
+        break
+      }
     } while (!done)
 
     await writeResultMetadata()
